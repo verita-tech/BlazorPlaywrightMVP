@@ -1,0 +1,17 @@
+@page "/"
+
+<PageTitle>Home</PageTitle>
+
+<h1 data-testid="home-title">Willkommen</h1>
+
+<AuthorizeView>
+    <Authorized>
+        <p data-testid="home-message">
+            Hallo, <strong>@context.User.Identity?.Name</strong>! 
+            Sie sind angemeldet.
+        </p>
+    </Authorized>
+    <NotAuthorized>
+        <p>Bitte melden Sie sich an.</p>
+    </NotAuthorized>
+</AuthorizeView>

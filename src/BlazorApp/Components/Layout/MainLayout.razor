@@ -1,0 +1,31 @@
+@inherits LayoutComponentBase
+
+<div class="page">
+    <div class="sidebar">
+        <NavMenu />
+    </div>
+
+    <main>
+        <div class="top-row px-4">
+            <AuthorizeView>
+                <Authorized>
+                    <span data-testid="username">@context.User.Identity?.Name</span>
+                    <AuthorizeView Roles="Admin">
+                        <Authorized>
+                            <span class="badge bg-danger ms-2" data-testid="admin-badge">Admin</span>
+                        </Authorized>
+                    </AuthorizeView>
+                    <AuthorizeView Roles="User">
+                        <Authorized>
+                            <span class="badge bg-primary ms-2" data-testid="user-badge">User</span>
+                        </Authorized>
+                    </AuthorizeView>
+                </Authorized>
+            </AuthorizeView>
+        </div>
+
+        <article class="content px-4">
+            @Body
+        </article>
+    </main>
+</div>

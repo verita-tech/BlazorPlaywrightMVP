@@ -1,0 +1,37 @@
+@page "/admin"
+@attribute [Authorize(Roles = "Admin")]
+
+<PageTitle>Admin</PageTitle>
+
+<h1 data-testid="admin-title">Admin-Bereich</h1>
+
+<div class="alert alert-danger" role="alert" data-testid="admin-warning">
+    ⚠️ Dies ist ein geschützter Admin-Bereich. Nur Administratoren haben Zugriff.
+</div>
+
+<p data-testid="admin-message">
+    Willkommen im Admin-Bereich, <strong>@User?.Identity?.Name</strong>!
+</p>
+
+<div class="card mt-3">
+    <div class="card-body">
+        <h5 class="card-title">Admin-Aktionen</h5>
+        <button class="btn btn-primary" data-testid="admin-action-btn">Admin-Aktion ausführen</button>
+    </div>
+</div>
+
+@code {
+    [CascadingParameter]
+    private Task<AuthenticationState>? AuthenticationState { get; set; }
+
+    private System.Security.Claims.ClaimsPrincipal? User { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (AuthenticationState != null)
+        {
+            var authState = await AuthenticationState;
+            User = authState.User;
+        }
+    }
+}

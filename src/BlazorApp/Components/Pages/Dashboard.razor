@@ -1,0 +1,28 @@
+@page "/dashboard"
+@attribute [Authorize(Roles = "User,Admin")]
+
+<PageTitle>Dashboard</PageTitle>
+
+<h1 data-testid="dashboard-title">Dashboard</h1>
+
+<p data-testid="dashboard-message">
+    Dies ist das Dashboard. Nur Benutzer mit den Rollen "User" oder "Admin" können diese Seite sehen.
+</p>
+
+<AuthorizeView>
+    <Authorized>
+        <div class="card mt-3">
+            <div class="card-body">
+                <h5 class="card-title">Benutzerinformationen</h5>
+                <p><strong>Name:</strong> <span data-testid="user-name">@context.User.Identity?.Name</span></p>
+                <p><strong>Rollen:</strong></p>
+                <ul data-testid="user-roles">
+                    @foreach (var claim in context.User.Claims.Where(c => c.Type == System.Security.Claims.ClaimTypes.Role))
+                    {
+                        <li>@claim.Value</li>
+                    }
+                </ul>
+            </div>
+        </div>
+    </Authorized>
+</AuthorizeView>
