@@ -196,3 +196,4 @@ WICHTIGE HINWEISE
   riesige Abfragen. Bei Bedarf anpassen.
 
 - oracledb laeuft im Thin-Mode: KEIN Oracle Instant Client noetig.
+
