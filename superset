@@ -1,15 +1,15 @@
 ############################################################################
-#  SUPERSET → ORACLE (schlankes Live-Setup)
+#  SUPERSET 6.1.0 -> ORACLE (schlankes Live-Setup)
 #
 #  Superset verbindet sich direkt mit Oracle. Postgres dient NUR als
 #  Superset-Metadaten-DB (Charts/Dashboards/User), Redis als Cache.
 #
 #  ORDNERSTRUKTUR (alle Dateien im selben Verzeichnis):
 #    superset-oracle/
-#    ├── Dockerfile
-#    ├── docker-compose.yml
-#    ├── superset_config.py
-#    └── .env            (aus .env.example erstellen)
+#    |-- Dockerfile
+#    |-- docker-compose.yml
+#    |-- superset_config.py
+#    +-- .env            (aus .env.example erstellen)
 ############################################################################
 
 
@@ -17,11 +17,14 @@
 DATEI: Dockerfile
 ==========================================================================
 
-# Superset 5.0.0 (lean) + benötigte Treiber.
+# Superset 6.1.0 (lean) + benötigte Treiber.
 # Das lean-Image bringt bewusst KEINE DB-Treiber mit, daher fügen wir hinzu:
 #   - psycopg2-binary : für die Metadaten-DB (Postgres)
 #   - oracledb        : für den Oracle-Zugriff (Thin-Mode, kein Instant Client!)
-FROM apache/superset:5.0.0
+# Hinweis: Ab Superset 6.0 ist Chromium NICHT mehr im Image. Für reine
+# Dashboards egal; nur falls du später Alerts & Reports mit Screenshots
+# brauchst, müsstest du beim Build INCLUDE_CHROMIUM=true setzen.
+FROM apache/superset:6.1.0
 
 USER root
 RUN pip install --no-cache-dir \
@@ -197,3 +200,6 @@ WICHTIGE HINWEISE
 
 - oracledb laeuft im Thin-Mode: KEIN Oracle Instant Client noetig.
 
+- Ab Superset 6.0 ist Chromium NICHT mehr im Standard-Image. Fuer reine
+  Dashboards egal. Nur falls du spaeter Alerts & Reports mit Screenshots
+  brauchst, im Dockerfile-Build INCLUDE_CHROMIUM=true ergaenzen.
