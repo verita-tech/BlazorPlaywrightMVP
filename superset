@@ -1,0 +1,198 @@
+############################################################################
+#  SUPERSET → ORACLE (schlankes Live-Setup)
+#
+#  Superset verbindet sich direkt mit Oracle. Postgres dient NUR als
+#  Superset-Metadaten-DB (Charts/Dashboards/User), Redis als Cache.
+#
+#  ORDNERSTRUKTUR (alle Dateien im selben Verzeichnis):
+#    superset-oracle/
+#    ├── Dockerfile
+#    ├── docker-compose.yml
+#    ├── superset_config.py
+#    └── .env            (aus .env.example erstellen)
+############################################################################
+
+
+==========================================================================
+DATEI: Dockerfile
+==========================================================================
+
+# Superset 5.0.0 (lean) + benötigte Treiber.
+# Das lean-Image bringt bewusst KEINE DB-Treiber mit, daher fügen wir hinzu:
+#   - psycopg2-binary : für die Metadaten-DB (Postgres)
+#   - oracledb        : für den Oracle-Zugriff (Thin-Mode, kein Instant Client!)
+FROM apache/superset:5.0.0
+
+USER root
+RUN pip install --no-cache-dir \
+      psycopg2-binary \
+      oracledb
+USER superset
+
+
+==========================================================================
+DATEI: docker-compose.yml
+==========================================================================
+
+services:
+  # Metadaten-DB von Superset (speichert Charts, Dashboards, User).
+  # NICHT deine Datenquelle – die ist Oracle.
+  postgres:
+    image: postgres:16
+    container_name: superset-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: superset
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: superset-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  superset:
+    build: .
+    container_name: superset-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset_home:/app/superset_home
+    command: >
+      bash -c "
+        superset db upgrade &&
+        superset init &&
+        (superset fab list-users | grep -q admin ||
+          superset fab create-admin
+            --username admin
+            --firstname Admin --lastname User
+            --email admin@example.com
+            --password ${SUPERSET_ADMIN_PASSWORD}) &&
+        /usr/bin/run-server.sh
+      "
+
+volumes:
+  pg_data:
+  redis_data:
+  superset_home:
+
+
+==========================================================================
+DATEI: superset_config.py
+==========================================================================
+
+import os
+
+# Metadaten-DB (Postgres-Container). Das ist NICHT deine Datenquelle.
+SQLALCHEMY_DATABASE_URI = (
+    f"postgresql+psycopg2://superset:{os.environ['POSTGRES_PASSWORD']}"
+    "@postgres:5432/superset"
+)
+
+SECRET_KEY = os.environ["SUPERSET_SECRET_KEY"]
+
+# Redis-Cache: entlastet Oracle, indem einmal geladene Dashboard-Ergebnisse
+# für eine Weile aus dem Cache kommen statt erneut aus Oracle.
+CACHE_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_DEFAULT_TIMEOUT": 60 * 60 * 6,   # 6 Stunden
+    "CACHE_KEY_PREFIX": "superset_",
+    "CACHE_REDIS_URL": "redis://redis:6379/0",
+}
+DATA_CACHE_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_DEFAULT_TIMEOUT": 60 * 60 * 6,
+    "CACHE_KEY_PREFIX": "superset_data_",
+    "CACHE_REDIS_URL": "redis://redis:6379/1",
+}
+
+# Schutz gegen versehentlich riesige Abfragen gegen Oracle.
+ROW_LIMIT = 10000
+SQL_MAX_ROW = 50000
+
+
+==========================================================================
+DATEI: .env.example
+==========================================================================
+
+# Kopieren nach ".env" und Werte setzen:  cp .env.example .env
+
+# Secret-Key erzeugen mit:  openssl rand -base64 42
+SUPERSET_SECRET_KEY=CHANGE_ME_langer_zufallswert
+SUPERSET_ADMIN_PASSWORD=CHANGE_ME_admin_passwort
+POSTGRES_PASSWORD=CHANGE_ME_postgres_passwort
+
+
+==========================================================================
+ANLEITUNG
+==========================================================================
+
+1) Konfiguration anlegen
+   cp .env.example .env
+   # .env oeffnen, alle CHANGE_ME-Werte setzen
+   # Secret-Key:  openssl rand -base64 42
+
+2) Bauen und starten
+   docker compose up -d --build
+   # Erststart dauert etwas (Image-Build + DB-Migration).
+
+3) Superset oeffnen
+   http://localhost:8088
+   Login: admin / <SUPERSET_ADMIN_PASSWORD aus .env>
+
+4) Oracle als Datenquelle verbinden
+   In Superset:  Settings -> Database Connections -> + Database
+   -> "Other"  und folgende SQLAlchemy-URI eintragen
+   (oracledb-Treiber, Thin-Mode):
+
+     oracle+oracledb://USER:PASSWORT@ORACLE_HOST:1521/?service_name=DEIN_SERVICE
+
+   Beispiel:
+     oracle+oracledb://reporting_reader:geheim@10.0.0.5:1521/?service_name=ORCLPDB1
+
+   Hinweis: service_name verwenden (nicht SID). Falls deine DB nur eine
+   SID hat, lautet die URI stattdessen:
+     oracle+oracledb://USER:PASSWORT@ORACLE_HOST:1521/DEINE_SID
+
+5) Datasets anlegen
+   Datasets -> + Dataset -> die Oracle-Verbindung, Schema und Tabelle
+   waehlen. Danach Charts und Dashboards bauen.
+
+==========================================================================
+WICHTIGE HINWEISE
+==========================================================================
+
+- ACHTUNG LIVE-ZUGRIFF: In diesem Setup laeuft JEDE Dashboard-Abfrage
+  direkt gegen Oracle. Der Redis-Cache mildert das (einmal geladene
+  Ergebnisse kommen 6h aus dem Cache), aber der erste Aufruf, neue Filter
+  und abgelaufener Cache treffen Oracle live. Fuer eine grosse Produktiv-DB
+  im Tagesbetrieb ist das riskant.
+
+- NUR-LESE-USER in Oracle anlegen (dringend empfohlen), damit Superset
+  garantiert nichts schreiben kann:
+    CREATE USER reporting_reader IDENTIFIED BY "dein_passwort";
+    GRANT CREATE SESSION TO reporting_reader;
+    GRANT SELECT ANY TABLE TO reporting_reader;   -- oder gezielt pro Tabelle
+
+- Die ROW_LIMIT/SQL_MAX_ROW in superset_config.py bremsen versehentlich
+  riesige Abfragen. Bei Bedarf anpassen.
+
+- oracledb laeuft im Thin-Mode: KEIN Oracle Instant Client noetig.
