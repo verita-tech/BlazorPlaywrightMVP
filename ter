@@ -1,0 +1,624 @@
+================================================================================
+METABASE 0.62.4.3 - HELM CHART + ANSIBLE DEPLOYMENT AUF UBUNTU SERVER
+================================================================================
+
+Ziel: Metabase (v0.62.4.3) via eigenem Helm Chart auf einen Ubuntu Server
+deployen. Kubernetes = k3s (leichtgewichtig, minimale Komplexitaet).
+Datenbank = PostgreSQL (App-DB von Metabase) im Cluster.
+
+--------------------------------------------------------------------------------
+0. VERZEICHNISSTRUKTUR
+--------------------------------------------------------------------------------
+
+metabase-deploy/
+├── ansible/
+│   ├── inventory.ini
+│   ├── ansible.cfg
+│   ├── playbook.yml
+│   └── group_vars/
+│       └── all.yml
+└── charts/
+    └── metabase/
+        ├── Chart.yaml
+        ├── values.yaml
+        └── templates/
+            ├── _helpers.tpl
+            ├── secret.yaml
+            ├── postgres-statefulset.yaml
+            ├── postgres-service.yaml
+            ├── deployment.yaml
+            ├── service.yaml
+            └── ingress.yaml
+
+
+================================================================================
+1. HELM CHART
+================================================================================
+
+--------------------------------------------------------------------------------
+charts/metabase/Chart.yaml
+--------------------------------------------------------------------------------
+apiVersion: v2
+name: metabase
+description: Metabase self-service BI
+type: application
+version: 1.0.0
+appVersion: "0.62.4.3"
+
+
+--------------------------------------------------------------------------------
+charts/metabase/values.yaml
+--------------------------------------------------------------------------------
+image:
+  repository: metabase/metabase
+  tag: "v0.62.4.3"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+metabase:
+  siteUrl: "https://metabase.example.com"
+  javaOpts: "-Xmx2g"
+  # Encryption key fuer gespeicherte DB-Credentials (openssl rand -base64 32)
+  encryptionSecretKey: "CHANGE_ME_BASE64_32"
+
+# Interne App-Datenbank (Metabase Metadaten)
+postgres:
+  enabled: true
+  image: postgres:16-alpine
+  database: metabase
+  username: metabase
+  password: "CHANGE_ME_DB_PASSWORD"
+  storageClass: "local-path"
+  storageSize: 10Gi
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: true
+  className: traefik
+  host: metabase.example.com
+  tls:
+    enabled: false
+    secretName: metabase-tls
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 3Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/_helpers.tpl
+--------------------------------------------------------------------------------
+{{- define "metabase.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "metabase.fullname" -}}
+{{- printf "%s-%s" .Release.Name (include "metabase.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "metabase.labels" -}}
+app.kubernetes.io/name: {{ include "metabase.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "metabase.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "metabase.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/secret.yaml
+--------------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "metabase.fullname" . }}
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  MB_DB_PASS: {{ .Values.postgres.password | quote }}
+  MB_ENCRYPTION_SECRET_KEY: {{ .Values.metabase.encryptionSecretKey | quote }}
+  POSTGRES_PASSWORD: {{ .Values.postgres.password | quote }}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/postgres-statefulset.yaml
+--------------------------------------------------------------------------------
+{{- if .Values.postgres.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "metabase.fullname" . }}-postgres
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+    component: postgres
+spec:
+  serviceName: {{ include "metabase.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "metabase.selectorLabels" . | nindent 6 }}
+      component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "metabase.selectorLabels" . | nindent 8 }}
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "metabase.fullname" . }}
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgres.username }}"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgres.username }}"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.postgres.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storageSize }}
+{{- end }}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/postgres-service.yaml
+--------------------------------------------------------------------------------
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metabase.fullname" . }}-postgres
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+    component: postgres
+spec:
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    {{- include "metabase.selectorLabels" . | nindent 4 }}
+    component: postgres
+{{- end }}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/deployment.yaml
+--------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "metabase.fullname" . }}
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "metabase.selectorLabels" . | nindent 6 }}
+      component: app
+  template:
+    metadata:
+      labels:
+        {{- include "metabase.selectorLabels" . | nindent 8 }}
+        component: app
+    spec:
+      containers:
+        - name: metabase
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: MB_DB_TYPE
+              value: postgres
+            - name: MB_DB_DBNAME
+              value: {{ .Values.postgres.database | quote }}
+            - name: MB_DB_PORT
+              value: "5432"
+            - name: MB_DB_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: MB_DB_HOST
+              value: {{ include "metabase.fullname" . }}-postgres
+            - name: MB_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "metabase.fullname" . }}
+                  key: MB_DB_PASS
+            - name: MB_ENCRYPTION_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "metabase.fullname" . }}
+                  key: MB_ENCRYPTION_SECRET_KEY
+            - name: MB_SITE_URL
+              value: {{ .Values.metabase.siteUrl | quote }}
+            - name: JAVA_OPTS
+              value: {{ .Values.metabase.javaOpts | quote }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/service.yaml
+--------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metabase.fullname" . }}
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "metabase.selectorLabels" . | nindent 4 }}
+    component: app
+
+
+--------------------------------------------------------------------------------
+charts/metabase/templates/ingress.yaml
+--------------------------------------------------------------------------------
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "metabase.fullname" . }}
+  labels:
+    {{- include "metabase.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "metabase.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
+
+
+================================================================================
+2. ANSIBLE
+================================================================================
+
+--------------------------------------------------------------------------------
+ansible/ansible.cfg
+--------------------------------------------------------------------------------
+[defaults]
+inventory = inventory.ini
+host_key_checking = False
+retry_files_enabled = False
+stdout_callback = yaml
+
+
+--------------------------------------------------------------------------------
+ansible/inventory.ini
+--------------------------------------------------------------------------------
+[metabase]
+mb-server ansible_host=192.168.1.50 ansible_user=ubuntu
+
+[metabase:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_become=true
+
+
+--------------------------------------------------------------------------------
+ansible/group_vars/all.yml
+--------------------------------------------------------------------------------
+k3s_version: "v1.31.4+k3s1"
+chart_src: "../charts/metabase"
+chart_dst: "/opt/metabase-chart"
+release_name: "metabase"
+namespace: "metabase"
+
+metabase_site_url: "https://metabase.example.com"
+metabase_host: "metabase.example.com"
+metabase_image_tag: "v0.62.4.3"
+
+# Besser via ansible-vault:
+#   ansible-vault encrypt_string 'geheim' --name 'postgres_password'
+postgres_password: "CHANGE_ME_DB_PASSWORD"
+metabase_encryption_key: "CHANGE_ME_BASE64_32"
+
+
+--------------------------------------------------------------------------------
+ansible/playbook.yml
+--------------------------------------------------------------------------------
+---
+- name: Deploy Metabase via Helm auf Ubuntu (k3s)
+  hosts: metabase
+  become: true
+
+  tasks:
+    # ---------- Basis ----------
+    - name: APT Cache aktualisieren
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Basispakete installieren
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - python3-pip
+        state: present
+
+    - name: Python kubernetes Lib (fuer Helm-Modul)
+      ansible.builtin.pip:
+        name:
+          - kubernetes>=24.2.0
+          - PyYAML
+        state: present
+        extra_args: --break-system-packages
+
+    # ---------- k3s ----------
+    - name: Pruefen ob k3s installiert ist
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
+
+    - name: k3s installieren
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_VERSION={{ k3s_version }} \
+          INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -
+      when: not k3s_bin.stat.exists
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Warten bis k3s-Node ready ist
+      ansible.builtin.shell: |
+        kubectl wait --for=condition=Ready node --all --timeout=180s
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: false
+
+    # ---------- Helm ----------
+    - name: Pruefen ob Helm installiert ist
+      ansible.builtin.stat:
+        path: /usr/local/bin/helm
+      register: helm_bin
+
+    - name: Helm installieren
+      ansible.builtin.shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      when: not helm_bin.stat.exists
+      args:
+        creates: /usr/local/bin/helm
+
+    # ---------- Chart ausrollen ----------
+    - name: Chart-Verzeichnis anlegen
+      ansible.builtin.file:
+        path: "{{ chart_dst }}"
+        state: directory
+        mode: "0755"
+
+    - name: Helm Chart auf Server kopieren
+      ansible.builtin.copy:
+        src: "{{ chart_src }}/"
+        dest: "{{ chart_dst }}/"
+        mode: "0644"
+        directory_mode: "0755"
+
+    - name: Namespace anlegen
+      kubernetes.core.k8s:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        api_version: v1
+        kind: Namespace
+        name: "{{ namespace }}"
+        state: present
+
+    - name: Metabase Helm Release deployen
+      kubernetes.core.helm:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        name: "{{ release_name }}"
+        chart_ref: "{{ chart_dst }}"
+        release_namespace: "{{ namespace }}"
+        create_namespace: true
+        wait: true
+        wait_timeout: 10m
+        values:
+          image:
+            tag: "{{ metabase_image_tag }}"
+          metabase:
+            siteUrl: "{{ metabase_site_url }}"
+            encryptionSecretKey: "{{ metabase_encryption_key }}"
+          postgres:
+            password: "{{ postgres_password }}"
+            storageClass: "local-path"
+          ingress:
+            enabled: true
+            className: traefik
+            host: "{{ metabase_host }}"
+
+    - name: Status ausgeben
+      ansible.builtin.shell: |
+        kubectl -n {{ namespace }} get pods,svc,ingress
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: mb_status
+      changed_when: false
+
+    - name: Deployment-Status
+      ansible.builtin.debug:
+        var: mb_status.stdout_lines
+
+
+================================================================================
+3. VORBEREITUNG / SECRETS
+================================================================================
+
+# Encryption Key generieren (einmalig, danach NIE aendern - sonst sind
+# gespeicherte DB-Credentials in Metabase unbrauchbar):
+openssl rand -base64 32
+
+# Passwoerter mit ansible-vault verschluesseln:
+ansible-vault encrypt_string 'MeinDbPasswort' --name 'postgres_password'
+ansible-vault encrypt_string 'base64key...'   --name 'metabase_encryption_key'
+# Ausgabe in group_vars/all.yml einfuegen.
+
+# Ansible Collection installieren (Control Node):
+ansible-galaxy collection install kubernetes.core
+
+
+================================================================================
+4. DEPLOYMENT
+================================================================================
+
+cd metabase-deploy/ansible
+
+# Verbindung testen
+ansible metabase -m ping
+
+# Deployen
+ansible-playbook playbook.yml --ask-vault-pass
+
+# Nur Helm-Teil erneut (Upgrade nach values-Aenderung)
+ansible-playbook playbook.yml --ask-vault-pass --start-at-task "Metabase Helm Release deployen"
+
+
+================================================================================
+5. NUETZLICHE BEFEHLE AUF DEM SERVER
+================================================================================
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+kubectl -n metabase get pods -w
+kubectl -n metabase logs -f deploy/metabase-metabase
+kubectl -n metabase describe pod -l app.kubernetes.io/name=metabase
+
+helm -n metabase list
+helm -n metabase status metabase
+helm -n metabase get values metabase
+helm -n metabase uninstall metabase
+
+# Ohne Ingress lokal testen:
+kubectl -n metabase port-forward svc/metabase-metabase 3000:3000
+# -> http://localhost:3000
+
+# Chart lokal validieren (vor dem Deploy):
+helm lint charts/metabase
+helm template metabase charts/metabase
+
+
+================================================================================
+6. HINWEISE
+================================================================================
+
+- Version: Image-Tag "v0.62.4.3" (Metabase OSS). Fuer Enterprise/Pro:
+  Repository auf "metabase/metabase-enterprise" umstellen.
+
+- Startzeit: Metabase braucht beim ersten Start 60-180s (DB-Migrationen).
+  Deshalb die grosszuegigen Probe-Timeouts. Nicht vorzeitig abbrechen.
+
+- Storage: k3s bringt "local-path" als Default-StorageClass mit
+  (Daten unter /var/lib/rancher/k3s/storage). Fuer Prod ggf. Backup des
+  Postgres-Volumes einrichten (pg_dump per CronJob).
+
+- Ingress: k3s bringt Traefik mit. DNS-Eintrag fuer metabase.example.com
+  auf die Server-IP zeigen lassen. Fuer TLS: cert-manager installieren
+  und ingress.tls.enabled=true setzen.
+
+- Externe Datenbanken (die Metabase abfragen soll) werden nicht hier,
+  sondern spaeter in der Metabase-UI unter Admin > Databases verbunden.
+  Direkte DB-Connectivity: Firewall/Netzwerk vom Cluster zur Ziel-DB
+  sicherstellen.
+
+- Firewall (UFW), falls aktiv:
+  ufw allow 6443/tcp   # k3s API
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+
+- Ressourcen: Metabase ist eine JVM-App. Min. 4 GB RAM auf dem Server,
+  JAVA_OPTS -Xmx2g passt zu limits.memory 3Gi.
+
+================================================================================
