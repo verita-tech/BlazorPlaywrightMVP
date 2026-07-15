@@ -1,0 +1,556 @@
+================================================================================
+METABASE 0.62.4.3 - K8S MANIFEST FUER PODMAN (podman kube play)
+Deployment auf Ubuntu Server via Ansible
+================================================================================
+
+Kein Kubernetes-Cluster. Podman liest K8s-YAML direkt ein ("podman kube play").
+
+WICHTIG - was Podman aus K8s-YAML unterstuetzt:
+  OK     : Pod, Deployment, PersistentVolumeClaim, ConfigMap, Secret,
+           DaemonSet, Job
+  IGNORE : Service (kein ClusterIP/DNS), Ingress, StatefulSet,
+           readinessProbe (nur livenessProbe wird gemappt), resources.limits
+           nur teilweise (cgroups v2)
+  ->  Deshalb: EIN Pod mit beiden Containern (metabase + postgres).
+      Container im selben Pod teilen sich localhost -> MB_DB_HOST=127.0.0.1.
+      Das ersetzt den fehlenden Service-DNS.
+
+--------------------------------------------------------------------------------
+0. VERZEICHNISSTRUKTUR
+--------------------------------------------------------------------------------
+
+metabase-podman/
+├── ansible/
+│   ├── ansible.cfg
+│   ├── inventory.ini
+│   ├── playbook.yml
+│   └── group_vars/
+│       └── all.yml
+└── manifests/
+    ├── metabase.yaml            # Haupt-Manifest (Pod + PVC + Secret + ConfigMap)
+    └── metabase.env.example
+
+
+================================================================================
+1. K8S MANIFEST (manifests/metabase.yaml)
+================================================================================
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metabase-pgdata
+  labels:
+    app: metabase
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metabase-plugins
+  labels:
+    app: metabase
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: metabase-secret
+  labels:
+    app: metabase
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "CHANGE_ME_DB_PASSWORD"
+  MB_DB_PASS: "CHANGE_ME_DB_PASSWORD"
+  MB_ENCRYPTION_SECRET_KEY: "CHANGE_ME_BASE64_32"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metabase-config
+  labels:
+    app: metabase
+data:
+  MB_DB_TYPE: "postgres"
+  MB_DB_DBNAME: "metabase"
+  MB_DB_PORT: "5432"
+  MB_DB_USER: "metabase"
+  MB_DB_HOST: "127.0.0.1"
+  MB_SITE_URL: "https://metabase.example.com"
+  MB_JETTY_HOST: "0.0.0.0"
+  MB_JETTY_PORT: "3000"
+  MB_PLUGINS_DIR: "/plugins"
+  JAVA_OPTS: "-Xmx2g -XX:+UseG1GC"
+  JAVA_TIMEZONE: "Europe/Berlin"
+  POSTGRES_DB: "metabase"
+  POSTGRES_USER: "metabase"
+  PGDATA: "/var/lib/postgresql/data/pgdata"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metabase
+  labels:
+    app: metabase
+spec:
+  restartPolicy: Always
+  containers:
+
+    # ---------------- Postgres (App-DB von Metabase) ----------------
+    - name: postgres
+      image: docker.io/library/postgres:16-alpine
+      envFrom:
+        - configMapRef:
+            name: metabase-config
+      env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: metabase-secret
+              key: POSTGRES_PASSWORD
+      volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+      livenessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -c
+            - pg_isready -U metabase -d metabase
+        initialDelaySeconds: 20
+        periodSeconds: 15
+        timeoutSeconds: 5
+        failureThreshold: 5
+
+    # ---------------- Metabase ----------------
+    - name: metabase
+      image: docker.io/metabase/metabase:v0.62.4.3
+      ports:
+        - containerPort: 3000
+          hostPort: 3000
+          protocol: TCP
+      envFrom:
+        - configMapRef:
+            name: metabase-config
+      env:
+        - name: MB_DB_PASS
+          valueFrom:
+            secretKeyRef:
+              name: metabase-secret
+              key: MB_DB_PASS
+        - name: MB_ENCRYPTION_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: metabase-secret
+              key: MB_ENCRYPTION_SECRET_KEY
+      volumeMounts:
+        - name: plugins
+          mountPath: /plugins
+      livenessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -c
+            - "curl -sf http://127.0.0.1:3000/api/health || exit 1"
+        initialDelaySeconds: 180
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 5
+
+  volumes:
+    - name: pgdata
+      persistentVolumeClaim:
+        claimName: metabase-pgdata
+    - name: plugins
+      persistentVolumeClaim:
+        claimName: metabase-plugins
+
+
+================================================================================
+2. ANSIBLE
+================================================================================
+
+--------------------------------------------------------------------------------
+ansible/ansible.cfg
+--------------------------------------------------------------------------------
+[defaults]
+inventory = inventory.ini
+host_key_checking = False
+retry_files_enabled = False
+stdout_callback = yaml
+
+--------------------------------------------------------------------------------
+ansible/inventory.ini
+--------------------------------------------------------------------------------
+[metabase]
+mb-server ansible_host=192.168.1.50 ansible_user=ubuntu
+
+[metabase:vars]
+ansible_python_interpreter=/usr/bin/python3
+
+--------------------------------------------------------------------------------
+ansible/group_vars/all.yml
+--------------------------------------------------------------------------------
+# Rootless-User, unter dem Metabase laeuft
+podman_user: "metabase"
+podman_uid: 2000
+podman_home: "/home/metabase"
+
+manifest_dir: "{{ podman_home }}/manifests"
+pod_name: "metabase"
+
+metabase_image: "docker.io/metabase/metabase:v0.62.4.3"
+postgres_image: "docker.io/library/postgres:16-alpine"
+metabase_site_url: "https://metabase.example.com"
+metabase_host_port: 3000
+
+# ACHTUNG: rootless kann standardmaessig keine Ports <1024 binden.
+# 3000 ist unproblematisch. Reverse Proxy (Caddy/nginx) davor fuer 80/443.
+
+# Besser via ansible-vault:
+#   ansible-vault encrypt_string 'geheim' --name 'postgres_password'
+postgres_password: "CHANGE_ME_DB_PASSWORD"
+metabase_encryption_key: "CHANGE_ME_BASE64_32"
+
+--------------------------------------------------------------------------------
+ansible/playbook.yml
+--------------------------------------------------------------------------------
+---
+- name: Metabase via podman kube play (rootless) auf Ubuntu deployen
+  hosts: metabase
+  become: true
+
+  tasks:
+    # ---------- Pakete ----------
+    - name: APT Cache aktualisieren
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Podman + Abhaengigkeiten installieren
+      ansible.builtin.apt:
+        name:
+          - podman
+          - uidmap
+          - slirp4netns
+          - fuse-overlayfs
+          - passt
+          - dbus-user-session
+          - curl
+        state: present
+
+    - name: Podman Version pruefen (>= 4.4 fuer kube play Features)
+      ansible.builtin.command: podman --version
+      register: podman_version
+      changed_when: false
+
+    - name: Version ausgeben
+      ansible.builtin.debug:
+        var: podman_version.stdout
+
+    # ---------- Rootless User ----------
+    - name: Service-User anlegen
+      ansible.builtin.user:
+        name: "{{ podman_user }}"
+        uid: "{{ podman_uid }}"
+        home: "{{ podman_home }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: subuid/subgid setzen
+      ansible.builtin.lineinfile:
+        path: "{{ item.file }}"
+        regexp: "^{{ podman_user }}:"
+        line: "{{ podman_user }}:200000:65536"
+        create: true
+      loop:
+        - { file: /etc/subuid }
+        - { file: /etc/subgid }
+
+    - name: Linger aktivieren (Pod laeuft ohne aktive Session weiter)
+      ansible.builtin.command: "loginctl enable-linger {{ podman_user }}"
+      args:
+        creates: "/var/lib/systemd/linger/{{ podman_user }}"
+
+    - name: Manifest-Verzeichnis anlegen
+      ansible.builtin.file:
+        path: "{{ manifest_dir }}"
+        state: directory
+        owner: "{{ podman_user }}"
+        group: "{{ podman_user }}"
+        mode: "0750"
+
+    # ---------- Manifest ausbringen ----------
+    - name: Manifest auf Server kopieren (mit Variablen)
+      ansible.builtin.template:
+        src: ../manifests/metabase.yaml
+        dest: "{{ manifest_dir }}/metabase.yaml"
+        owner: "{{ podman_user }}"
+        group: "{{ podman_user }}"
+        mode: "0640"
+      register: manifest_file
+
+    # ---------- Deploy ----------
+    - name: Images vorziehen
+      become_user: "{{ podman_user }}"
+      ansible.builtin.command: "podman pull {{ item }}"
+      loop:
+        - "{{ metabase_image }}"
+        - "{{ postgres_image }}"
+      register: pull_result
+      changed_when: "'Copying' in pull_result.stdout"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_uid }}"
+
+    - name: Pod deployen / aktualisieren
+      become_user: "{{ podman_user }}"
+      ansible.builtin.command: >
+        podman kube play --replace
+        {{ manifest_dir }}/metabase.yaml
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_uid }}"
+      register: kube_play
+      changed_when: true
+
+    - name: Play-Ausgabe
+      ansible.builtin.debug:
+        var: kube_play.stdout_lines
+
+    # ---------- systemd Unit (Autostart nach Reboot) ----------
+    - name: systemd user-Verzeichnis anlegen
+      ansible.builtin.file:
+        path: "{{ podman_home }}/.config/systemd/user"
+        state: directory
+        owner: "{{ podman_user }}"
+        group: "{{ podman_user }}"
+        mode: "0755"
+
+    - name: Quadlet .kube Unit schreiben
+      ansible.builtin.copy:
+        dest: "{{ podman_home }}/.config/containers/systemd/metabase.kube"
+        owner: "{{ podman_user }}"
+        group: "{{ podman_user }}"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Metabase Pod (podman kube play)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Kube]
+          Yaml={{ manifest_dir }}/metabase.yaml
+          PublishPort={{ metabase_host_port }}:3000
+
+          [Service]
+          Restart=always
+          TimeoutStartSec=900
+
+          [Install]
+          WantedBy=default.target
+      register: quadlet
+
+    - name: systemd user daemon-reload
+      become_user: "{{ podman_user }}"
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_uid }}"
+
+    - name: Service aktivieren + starten
+      become_user: "{{ podman_user }}"
+      ansible.builtin.systemd:
+        name: metabase.service
+        state: started
+        enabled: true
+        scope: user
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_uid }}"
+
+    # ---------- Health Check ----------
+    - name: Auf Metabase-Health warten (bis 5 min)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ metabase_host_port }}/api/health"
+        status_code: 200
+      register: health
+      until: health.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Status
+      become_user: "{{ podman_user }}"
+      ansible.builtin.command: "podman pod ps --filter name={{ pod_name }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_uid }}"
+      register: pod_status
+      changed_when: false
+
+    - name: Ergebnis
+      ansible.builtin.debug:
+        var: pod_status.stdout_lines
+
+
+================================================================================
+3. MANIFEST ALS JINJA-TEMPLATE (falls Variablen statt Platzhalter gewuenscht)
+================================================================================
+
+Im obigen Playbook wird "template:" genutzt. Dazu im Manifest ersetzen:
+
+  stringData:
+    POSTGRES_PASSWORD: "{{ '{{' }} postgres_password {{ '}}' }}"
+    MB_DB_PASS: "{{ '{{' }} postgres_password {{ '}}' }}"
+    MB_ENCRYPTION_SECRET_KEY: "{{ '{{' }} metabase_encryption_key {{ '}}' }}"
+
+  data:
+    MB_SITE_URL: "{{ '{{' }} metabase_site_url {{ '}}' }}"
+
+  image: "{{ '{{' }} metabase_image {{ '}}' }}"
+
+Alternativ: "copy:" statt "template:" verwenden und Secrets separat mit
+"podman secret create" pflegen.
+
+
+================================================================================
+4. VORBEREITUNG
+================================================================================
+
+# Encryption Key generieren (EINMALIG, danach nie aendern):
+openssl rand -base64 32
+
+# Secrets verschluesseln:
+ansible-vault encrypt_string 'MeinDbPasswort' --name 'postgres_password'
+ansible-vault encrypt_string 'base64key...'   --name 'metabase_encryption_key'
+
+
+================================================================================
+5. DEPLOYMENT
+================================================================================
+
+cd metabase-podman/ansible
+
+ansible metabase -m ping
+ansible-playbook playbook.yml --ask-vault-pass
+
+# Nur Manifest neu einspielen:
+ansible-playbook playbook.yml --ask-vault-pass --start-at-task "Pod deployen / aktualisieren"
+
+
+================================================================================
+6. MANUELL AUF DEM SERVER (als User "metabase")
+================================================================================
+
+su - metabase
+
+# Deploy / Redeploy
+podman kube play --replace ~/manifests/metabase.yaml
+
+# Abbauen
+podman kube down ~/manifests/metabase.yaml
+
+# Abbauen inkl. Volumes (ACHTUNG: Datenverlust)
+podman kube down --force ~/manifests/metabase.yaml
+
+# Status
+podman pod ps
+podman ps --pod
+podman logs -f metabase-metabase
+podman logs -f metabase-postgres
+
+# In den Container
+podman exec -it metabase-postgres psql -U metabase -d metabase
+
+# Volumes
+podman volume ls
+podman volume inspect metabase-pgdata
+
+# systemd (rootless)
+systemctl --user status metabase.service
+systemctl --user restart metabase.service
+journalctl --user -u metabase.service -f
+
+# Aus laufendem Pod wieder K8s-YAML generieren:
+podman kube generate metabase -f /tmp/dump.yaml
+
+
+================================================================================
+7. REVERSE PROXY (Caddy, fuer TLS auf 443)
+================================================================================
+
+apt install -y caddy
+
+# /etc/caddy/Caddyfile
+metabase.example.com {
+    reverse_proxy 127.0.0.1:3000
+}
+
+systemctl reload caddy
+
+# Damit uebernimmt Caddy automatisch Let's Encrypt.
+# MB_SITE_URL im ConfigMap muss dann auf https://metabase.example.com stehen.
+
+
+================================================================================
+8. BACKUP (Postgres)
+================================================================================
+
+# Dump
+podman exec metabase-postgres \
+  pg_dump -U metabase -d metabase -Fc -f /tmp/mb.dump
+podman cp metabase-postgres:/tmp/mb.dump ./mb-$(date +%F).dump
+
+# Restore
+podman cp ./mb-2026-07-15.dump metabase-postgres:/tmp/mb.dump
+podman exec metabase-postgres \
+  pg_restore -U metabase -d metabase --clean /tmp/mb.dump
+
+# Als systemd-Timer (rootless), ~/.config/systemd/user/mb-backup.timer
+# + mb-backup.service mit obigem pg_dump-Befehl.
+
+
+================================================================================
+9. STOLPERFALLEN
+================================================================================
+
+- Service/Ingress im Manifest: werden von Podman ignoriert. Portfreigabe
+  passiert ueber "hostPort" im Container oder PublishPort in der Quadlet-Unit.
+  Nicht beides mit widerspruechlichen Werten setzen.
+
+- StatefulSet: nicht unterstuetzt. Deshalb Pod + PVC.
+
+- readinessProbe: wird nicht gemappt, nur livenessProbe. Der Health-Check
+  im Playbook (uri-Modul) uebernimmt das Warten.
+
+- MB_DB_HOST=127.0.0.1: funktioniert nur, weil beide Container im selben
+  Pod denselben Netzwerk-Namespace teilen. Bei Trennung in zwei Pods
+  braucht es ein Podman-Network + Container-Namen als Hostname.
+
+- Rootless + Ports <1024: nicht ohne
+  "sysctl net.ipv4.ip_unprivileged_port_start=80". Reverse Proxy ist sauberer.
+
+- Linger: ohne "loginctl enable-linger" stirbt der Pod beim Logout des Users.
+
+- PVCs werden als benannte Podman-Volumes angelegt. "podman kube down" ohne
+  --force laesst sie bestehen - gewollt.
+
+- Erststart dauert 60-180s (DB-Migrationen). Nicht vorzeitig killen.
+
+- Quadlet braucht Podman >= 4.4. Ubuntu 24.04 liefert 4.9 -> ok.
+  Ubuntu 22.04 liefert 3.4 -> dann Quadlet weglassen und stattdessen
+  "podman generate systemd" nutzen (deprecated, funktioniert aber).
+
+- Externe Ziel-Datenbanken werden spaeter in der Metabase-UI unter
+  Admin > Databases verbunden. Rootless-Podman-Container erreichen das
+  LAN normal via slirp4netns/pasta - keine Extra-Konfiguration noetig.
+
+================================================================================
