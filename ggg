@@ -1,37 +1,53 @@
 ================================================================================
-METABASE 0.62.4.3 - PODMAN KUBE PLAY, HTTP-ONLY, SECRETS VIA ANSIBLE-VAULT
-Deployment auf Ubuntu Server
+METABASE 0.62.4.3 - PODMAN KUBE PLAY, HTTP-ONLY, ANSIBLE-VAULT
+Deployment: lokal (Workstation) UND via Azure DevOps Agent
 ================================================================================
 
 Setup:
   - Kein Kubernetes-Cluster. Podman liest K8s-YAML via "podman kube play".
   - Kein TLS im Container. Metabase laeuft auf HTTP, Port 3000.
-  - Alle Secrets + Umgebungswerte kommen aus ansible-vault, nichts im Klartext
-    im Manifest. Das Manifest ist ein Jinja2-Template.
+  - Alle Secrets via ansible-vault. Nichts im Klartext im Repo.
   - Rootless Podman unter eigenem Service-User, Autostart via Quadlet.
+  - EIN Playbook, ZWEI Wege: lokal + Azure DevOps Pipeline.
 
-Sicherheitshinweis: HTTP heisst Login im Klartext im Netz. Fuer internes LAN
-ok, fuer Kundenzugriff spaeter Caddy + Let's Encrypt davor (siehe Abschnitt 9).
+Kernprinzip: Das Playbook weiss nicht, wer es aufruft. Unterschiede stecken
+ausschliesslich in der Herkunft von Vault-Passwort, SSH-Key und Inventory.
+
+  lokal          : .vault_pass Datei      + ~/.ssh/id_ed25519  + inventory.ini
+  Azure DevOps   : Secret Variable        + Secure File        + generiertes
+                   -> /tmp/.vault_pass                            Inventory
 
 --------------------------------------------------------------------------------
 0. VERZEICHNISSTRUKTUR
 --------------------------------------------------------------------------------
 
 metabase-podman/
+├── .gitignore
+├── azure-pipelines.yml              # Pipeline-Definition
 ├── ansible/
 │   ├── ansible.cfg
-│   ├── inventory.ini
+│   ├── requirements.yml
+│   ├── inventory.ini                # nur fuer lokal
 │   ├── playbook.yml
 │   ├── group_vars/
-│   │   ├── all.yml            # nicht-geheime Variablen (Klartext)
-│   │   └── vault.yml          # ansible-vault verschluesselt
+│   │   ├── all.yml                  # Klartext, keine Secrets
+│   │   └── vault.yml                # ansible-vault verschluesselt (im Repo!)
 │   └── templates/
-│       └── metabase.yaml.j2   # K8s-Manifest als Template
-└── .vault_pass                # optional, chmod 600, in .gitignore!
+│       └── metabase.yaml.j2
+└── .vault_pass                      # NUR lokal, NIE committen
+
+
+--------------------------------------------------------------------------------
+.gitignore
+--------------------------------------------------------------------------------
+.vault_pass
+*.retry
+*.log
+inventory.local.ini
 
 
 ================================================================================
-1. VAULT ANLEGEN
+1. VAULT ANLEGEN (einmalig, lokal)
 ================================================================================
 
 cd metabase-podman/ansible
@@ -40,28 +56,25 @@ cd metabase-podman/ansible
 # in Metabase gespeicherten DB-Credentials unbrauchbar):
 openssl rand -base64 32
 
-# Vault-Datei erstellen:
 ansible-vault create group_vars/vault.yml
 
-# Inhalt von group_vars/vault.yml (im Editor eingeben):
+# Inhalt:
 ---
 vault_postgres_password: "EinLangesSicheresPasswort123!"
 vault_metabase_encryption_key: "<Ausgabe von openssl rand -base64 32>"
 vault_metabase_admin_email: "admin@example.com"
 
-# Spaeter bearbeiten:
-ansible-vault edit group_vars/vault.yml
+# Die verschluesselte vault.yml WIRD committed. Das ist ihr Zweck.
+# Nur das Vault-Passwort selbst bleibt draussen.
 
-# Ansehen:
-ansible-vault view group_vars/vault.yml
-
-# Passwort aendern:
+# Bearbeiten / ansehen / Passwort wechseln:
+ansible-vault edit  group_vars/vault.yml
+ansible-vault view  group_vars/vault.yml
 ansible-vault rekey group_vars/vault.yml
 
-# Optional: Vault-Passwort in Datei (bequemer, aber schuetzen!)
-echo "meinVaultPasswort" > .vault_pass
-chmod 600 .vault_pass
-echo ".vault_pass" >> ../.gitignore
+# Lokale Passwortdatei:
+echo "meinVaultPasswort" > ../.vault_pass
+chmod 600 ../.vault_pass
 
 
 ================================================================================
@@ -76,14 +89,28 @@ inventory = inventory.ini
 host_key_checking = False
 retry_files_enabled = False
 stdout_callback = yaml
-vault_password_file = .vault_pass    # weglassen, wenn --ask-vault-pass gewuenscht
+interpreter_python = auto_silent
+# KEIN vault_password_file hier!
+# Lokal:  --vault-password-file ../.vault_pass  (siehe Alias unten)
+# Azure:  --vault-password-file $(Agent.TempDirectory)/.vault_pass
+# So bleibt die Datei fuer beide Wege identisch.
 
 [ssh_connection]
 pipelining = True
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=no
 
 
 --------------------------------------------------------------------------------
-ansible/inventory.ini
+ansible/requirements.yml
+--------------------------------------------------------------------------------
+---
+collections:
+  - name: ansible.posix
+  - name: community.general
+
+
+--------------------------------------------------------------------------------
+ansible/inventory.ini   (nur lokal - Azure generiert sein eigenes)
 --------------------------------------------------------------------------------
 [metabase]
 mb-server ansible_host=192.168.1.50 ansible_user=ubuntu
@@ -93,13 +120,11 @@ ansible_python_interpreter=/usr/bin/python3
 
 
 --------------------------------------------------------------------------------
-ansible/group_vars/all.yml   (Klartext - keine Secrets hier!)
+ansible/group_vars/all.yml   (Klartext - keine Secrets!)
 --------------------------------------------------------------------------------
 ---
 # ---- Server / Netzwerk ----
-# IP oder Hostname, ueber die Metabase erreichbar ist.
-# MUSS exakt der URL entsprechen, die im Browser genutzt wird,
-# sonst gibt es Redirect-Probleme beim Login.
+# Ueberschreibbar per -e (Azure setzt das aus Pipeline-Variablen)
 metabase_server_ip: "192.168.1.50"
 metabase_host_port: 3000
 metabase_site_url: "http://{{ metabase_server_ip }}:{{ metabase_host_port }}"
@@ -126,8 +151,6 @@ pgdata_size: "10Gi"
 plugins_size: "1Gi"
 
 # ---- Mapping Vault -> normale Variablen ----
-# Konvention: vault_* nur in vault.yml, hier durchgereicht.
-# Vorteil: man sieht auf einen Blick, was aus dem Vault kommt.
 postgres_password: "{{ vault_postgres_password }}"
 metabase_encryption_key: "{{ vault_metabase_encryption_key }}"
 metabase_admin_email: "{{ vault_metabase_admin_email }}"
@@ -294,7 +317,7 @@ spec:
 
 
 ================================================================================
-4. PLAYBOOK
+4. PLAYBOOK (identisch fuer lokal und Azure)
 ================================================================================
 
 --------------------------------------------------------------------------------
@@ -320,8 +343,17 @@ ansible/playbook.yml
           - vault_metabase_encryption_key | length >= 32
         fail_msg: >
           Vault-Variablen fehlen oder sind zu kurz.
-          Bitte 'ansible-vault edit group_vars/vault.yml' pruefen.
+          Lokal:  ansible-vault edit group_vars/vault.yml
+          Azure:  Secret Variable ANSIBLE_VAULT_PASSWORD pruefen.
         quiet: true
+
+    - name: Deployment-Kontext ausgeben
+      ansible.builtin.debug:
+        msg:
+          - "Ziel      : {{ inventory_hostname }} ({{ ansible_host }})"
+          - "Site URL  : {{ metabase_site_url }}"
+          - "Image     : {{ metabase_image }}"
+          - "Ausgeloest: {{ deploy_source | default('lokal') }}"
 
     # ---------- Pakete ----------
     - name: APT Cache aktualisieren
@@ -395,8 +427,8 @@ ansible/playbook.yml
         dest: "{{ manifest_dir }}/metabase.yaml"
         owner: "{{ podman_user }}"
         group: "{{ podman_user }}"
-        mode: "0600"      # enthaelt Secrets -> nur der Service-User
-      no_log: true        # Diff nicht ins Log schreiben
+        mode: "0600"
+      no_log: true
       register: manifest_file
 
     # ---------- Images ----------
@@ -498,44 +530,389 @@ ansible/playbook.yml
 
 
 ================================================================================
-5. DEPLOYMENT
+5. AZURE DEVOPS - VORBEREITUNG
+================================================================================
+
+--------------------------------------------------------------------------------
+5.1 SSH-Key fuer den Agent
+--------------------------------------------------------------------------------
+
+# Auf der Workstation ein dediziertes Deploy-Keypair erzeugen (ohne Passphrase,
+# da der Agent unbeaufsichtigt laeuft):
+ssh-keygen -t ed25519 -C "azdo-metabase-deploy" -f ~/.ssh/azdo_metabase -N ""
+
+# Public Key auf den Zielserver:
+ssh-copy-id -i ~/.ssh/azdo_metabase.pub ubuntu@192.168.1.50
+
+# Testen:
+ssh -i ~/.ssh/azdo_metabase ubuntu@192.168.1.50 'echo ok'
+
+# Private Key in Azure DevOps hochladen:
+#   Pipelines > Library > Secure files > + Secure file
+#   Datei: ~/.ssh/azdo_metabase
+#   Name : azdo_metabase
+# Danach: Secure file > ... > Pipeline permissions > Zugriff fuer die Pipeline
+# freigeben (sonst schlaegt DownloadSecureFile fehl).
+
+--------------------------------------------------------------------------------
+5.2 Variable Group
+--------------------------------------------------------------------------------
+
+Pipelines > Library > + Variable group
+Name: metabase-deploy
+
+  ANSIBLE_VAULT_PASSWORD   = <Vault-Passwort>      [Schloss-Icon = secret!]
+  METABASE_SERVER_IP       = 192.168.1.50
+  METABASE_SSH_USER        = ubuntu
+
+# Optional: statt Klartext-Secret an Azure Key Vault anbinden
+#   Variable group > Link secrets from an Azure key vault as variables
+#   -> ANSIBLE_VAULT_PASSWORD kommt dann aus dem Key Vault.
+# Das ist die sauberere Variante, wenn ein Key Vault existiert.
+
+# Variable group > Pipeline permissions > Pipeline freigeben.
+
+--------------------------------------------------------------------------------
+5.3 Environment (fuer Approvals)
+--------------------------------------------------------------------------------
+
+Pipelines > Environments > New environment
+Name: metabase-prod
+  -> Approvals and checks > Approvals > Genehmiger eintragen
+
+Damit haelt die Pipeline vor dem Deploy an und wartet auf Freigabe.
+
+--------------------------------------------------------------------------------
+5.4 Agent-Anforderungen
+--------------------------------------------------------------------------------
+
+Microsoft-hosted (ubuntu-latest):
+  + Nichts zu warten, Ansible ist vorinstalliert
+  - Braucht Netzwerkzugang zum Zielserver (bei internem LAN meist NICHT gegeben)
+
+Self-hosted Agent:
+  + Sieht das interne Netz
+  - Muss selbst gepflegt werden
+  Voraussetzungen: python3, python3-pip, openssh-client
+  Ansible wird von der Pipeline per pip installiert (siehe unten).
+
+Bei internem Zielserver: self-hosted Agent oder Azure DevOps Managed DevOps Pool
+mit VNet-Anbindung. Der Pool-Name wird unten in "pool:" gesetzt.
+
+
+================================================================================
+6. AZURE PIPELINE
+================================================================================
+
+--------------------------------------------------------------------------------
+azure-pipelines.yml
+--------------------------------------------------------------------------------
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - ansible/**
+      - azure-pipelines.yml
+
+pr: none
+
+variables:
+  - group: metabase-deploy          # ANSIBLE_VAULT_PASSWORD, METABASE_SERVER_IP, ...
+  - name: ansibleDir
+    value: '$(Build.SourcesDirectory)/ansible'
+
+pool:
+  # Microsoft-hosted:
+  vmImage: 'ubuntu-latest'
+  # Self-hosted (bei internem Zielserver):
+  # name: 'MeinSelfHostedPool'
+  # demands:
+  #   - agent.os -equals Linux
+
+stages:
+
+# ============================================================
+- stage: Validate
+  displayName: 'Lint & Validate'
+  jobs:
+    - job: lint
+      displayName: 'Syntax-Check'
+      steps:
+
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.11'
+
+        - script: |
+            set -e
+            python -m pip install --upgrade pip
+            pip install "ansible-core>=2.16" ansible-lint
+            ansible-galaxy collection install -r requirements.yml
+          workingDirectory: $(ansibleDir)
+          displayName: 'Ansible installieren'
+
+        - script: |
+            set -e
+            echo "$(ANSIBLE_VAULT_PASSWORD)" > $(Agent.TempDirectory)/.vault_pass
+            chmod 600 $(Agent.TempDirectory)/.vault_pass
+          displayName: 'Vault-Passwort bereitstellen'
+          env:
+            ANSIBLE_VAULT_PASSWORD: $(ANSIBLE_VAULT_PASSWORD)
+
+        - script: |
+            set -e
+            ansible-playbook playbook.yml \
+              --syntax-check \
+              --vault-password-file $(Agent.TempDirectory)/.vault_pass \
+              -i inventory.ini
+          workingDirectory: $(ansibleDir)
+          displayName: 'Syntax-Check'
+
+        - script: |
+            ansible-lint playbook.yml || true
+          workingDirectory: $(ansibleDir)
+          displayName: 'ansible-lint (nicht blockierend)'
+
+        - script: |
+            set -e
+            ansible-vault view group_vars/vault.yml \
+              --vault-password-file $(Agent.TempDirectory)/.vault_pass > /dev/null
+            echo "Vault entschluesselbar."
+          workingDirectory: $(ansibleDir)
+          displayName: 'Vault-Zugriff pruefen'
+
+        - script: rm -f $(Agent.TempDirectory)/.vault_pass
+          condition: always()
+          displayName: 'Vault-Passwort aufraeumen'
+
+# ============================================================
+- stage: Deploy
+  displayName: 'Deploy auf Zielserver'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+    - deployment: deploy_metabase
+      displayName: 'Metabase deployen'
+      environment: 'metabase-prod'      # -> Approval greift hier
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+              - checkout: self
+
+              - task: UsePythonVersion@0
+                inputs:
+                  versionSpec: '3.11'
+
+              - script: |
+                  set -e
+                  python -m pip install --upgrade pip
+                  pip install "ansible-core>=2.16"
+                  ansible-galaxy collection install -r requirements.yml
+                  ansible --version
+                workingDirectory: $(ansibleDir)
+                displayName: 'Ansible installieren'
+
+              # ---- SSH-Key aus Secure Files ----
+              - task: DownloadSecureFile@1
+                name: sshKey
+                displayName: 'SSH-Key laden'
+                inputs:
+                  secureFile: 'azdo_metabase'
+
+              - script: |
+                  set -e
+                  mkdir -p ~/.ssh
+                  chmod 700 ~/.ssh
+                  cp "$(sshKey.secureFilePath)" ~/.ssh/azdo_metabase
+                  chmod 600 ~/.ssh/azdo_metabase
+                  ssh-keyscan -H "$(METABASE_SERVER_IP)" >> ~/.ssh/known_hosts 2>/dev/null || true
+                displayName: 'SSH-Key einrichten'
+
+              # ---- Vault-Passwort aus Secret Variable ----
+              - script: |
+                  set -e
+                  printf '%s' "$ANSIBLE_VAULT_PASSWORD" > $(Agent.TempDirectory)/.vault_pass
+                  chmod 600 $(Agent.TempDirectory)/.vault_pass
+                displayName: 'Vault-Passwort bereitstellen'
+                env:
+                  ANSIBLE_VAULT_PASSWORD: $(ANSIBLE_VAULT_PASSWORD)
+
+              # ---- Inventory dynamisch erzeugen ----
+              - script: |
+                  set -e
+                  cat > $(Agent.TempDirectory)/inventory.ini <<EOF
+                  [metabase]
+                  mb-server ansible_host=$(METABASE_SERVER_IP) ansible_user=$(METABASE_SSH_USER)
+
+                  [metabase:vars]
+                  ansible_python_interpreter=/usr/bin/python3
+                  ansible_ssh_private_key_file=~/.ssh/azdo_metabase
+                  EOF
+                  cat $(Agent.TempDirectory)/inventory.ini
+                displayName: 'Inventory generieren'
+
+              # ---- Erreichbarkeit ----
+              - script: |
+                  set -e
+                  ansible metabase \
+                    -i $(Agent.TempDirectory)/inventory.ini \
+                    -m ping
+                workingDirectory: $(ansibleDir)
+                displayName: 'Zielserver erreichbar?'
+                env:
+                  ANSIBLE_HOST_KEY_CHECKING: 'False'
+
+              # ---- Dry-Run ----
+              - script: |
+                  set -e
+                  ansible-playbook playbook.yml \
+                    -i $(Agent.TempDirectory)/inventory.ini \
+                    --vault-password-file $(Agent.TempDirectory)/.vault_pass \
+                    --check --diff \
+                    -e "metabase_server_ip=$(METABASE_SERVER_IP)" \
+                    -e "deploy_source=azure-devops-check" \
+                    || echo "Check-Mode meldet Abweichungen (bei Erstinstallation normal)."
+                workingDirectory: $(ansibleDir)
+                displayName: 'Dry-Run (--check)'
+                env:
+                  ANSIBLE_HOST_KEY_CHECKING: 'False'
+                  ANSIBLE_FORCE_COLOR: 'True'
+
+              # ---- Deploy ----
+              - script: |
+                  set -e
+                  ansible-playbook playbook.yml \
+                    -i $(Agent.TempDirectory)/inventory.ini \
+                    --vault-password-file $(Agent.TempDirectory)/.vault_pass \
+                    -e "metabase_server_ip=$(METABASE_SERVER_IP)" \
+                    -e "deploy_source=azure-devops (Build $(Build.BuildNumber))"
+                workingDirectory: $(ansibleDir)
+                displayName: 'Playbook ausfuehren'
+                env:
+                  ANSIBLE_HOST_KEY_CHECKING: 'False'
+                  ANSIBLE_FORCE_COLOR: 'True'
+
+              # ---- Smoke Test ----
+              - script: |
+                  set -e
+                  URL="http://$(METABASE_SERVER_IP):3000/api/health"
+                  for i in $(seq 1 30); do
+                    if curl -sf "$URL" > /dev/null; then
+                      echo "Metabase gesund: $URL"
+                      exit 0
+                    fi
+                    echo "Versuch $i/30 - warte 10s..."
+                    sleep 10
+                  done
+                  echo "Health-Check fehlgeschlagen."
+                  exit 1
+                displayName: 'Smoke Test'
+
+              # ---- Aufraeumen ----
+              - script: |
+                  rm -f $(Agent.TempDirectory)/.vault_pass
+                  rm -f ~/.ssh/azdo_metabase
+                  rm -f $(Agent.TempDirectory)/inventory.ini
+                condition: always()
+                displayName: 'Secrets aufraeumen'
+
+
+================================================================================
+7. DEPLOYMENT - LOKAL
 ================================================================================
 
 cd metabase-podman/ansible
 
+# Bequemer Alias (in ~/.bashrc):
+alias ap='ansible-playbook --vault-password-file ../.vault_pass'
+
 # Verbindung testen
 ansible metabase -m ping
 
-# Deployen (Vault-Passwort aus .vault_pass via ansible.cfg)
-ansible-playbook playbook.yml
+# Dry-Run
+ap playbook.yml --check --diff
 
-# Ohne .vault_pass-Datei:
+# Deployen
+ap playbook.yml
+
+# Ohne Alias:
+ansible-playbook playbook.yml --vault-password-file ../.vault_pass
+
+# Interaktiv (ohne .vault_pass Datei):
 ansible-playbook playbook.yml --ask-vault-pass
 
-# Dry-Run
-ansible-playbook playbook.yml --check --diff
+# Anderer Zielserver ad-hoc:
+ansible-playbook playbook.yml \
+  --vault-password-file ../.vault_pass \
+  -e "metabase_server_ip=10.0.0.99"
 
-# Nur neu rendern + neustarten
-ansible-playbook playbook.yml --tags never --start-at-task "Manifest rendern (Secrets aus Vault)"
-
-# Danach im Browser:
-#   http://192.168.1.50:3000
-# Ersteinrichtung: Admin-Account anlegen.
+# Danach: http://192.168.1.50:3000  -> Admin-Account anlegen
 
 
 ================================================================================
-6. FIREWALL
+8. DEPLOYMENT - AZURE DEVOPS
+================================================================================
+
+# Einmalig:
+#  1. Repo pushen (inkl. verschluesselter vault.yml, OHNE .vault_pass)
+#  2. Secure file "azdo_metabase" hochladen + Pipeline-Permission
+#  3. Variable group "metabase-deploy" anlegen + Pipeline-Permission
+#  4. Environment "metabase-prod" anlegen (+ Approval)
+#  5. Pipelines > New pipeline > Repo waehlen > Existing YAML > azure-pipelines.yml
+
+# Danach:
+#  - Push auf main -> Pipeline laeuft automatisch
+#  - Stage Validate: Syntax + Vault-Zugriff
+#  - Stage Deploy  : wartet auf Approval, dann Dry-Run + Deploy + Smoke Test
+
+# Manuell starten: Pipelines > Run pipeline
+# Anderer Server: Variable METABASE_SERVER_IP beim Run ueberschreiben
+#                 (Variable group > "Let users override this value" aktivieren)
+
+
+================================================================================
+9. WAS SICH ZWISCHEN LOKAL UND AZURE UNTERSCHEIDET
+================================================================================
+
+  Aspekt              | Lokal                      | Azure DevOps
+  --------------------|----------------------------|---------------------------
+  Vault-Passwort      | ../.vault_pass (gitignored)| Secret Variable
+                      |                            | -> $(Agent.TempDirectory)
+  SSH-Key             | ~/.ssh/id_ed25519          | Secure File -> ~/.ssh/
+  Inventory           | inventory.ini (im Repo)    | zur Laufzeit generiert
+  Zielserver-IP       | group_vars/all.yml         | Variable METABASE_SERVER_IP
+                      |                            | via -e ueberschrieben
+  Ansible             | lokal installiert          | pip install im Job
+  Freigabe            | keine                      | Environment Approval
+  Aufraeumen          | entfaellt                  | rm in condition: always()
+
+  IDENTISCH: playbook.yml, templates/, group_vars/all.yml, vault.yml, ansible.cfg
+
+  Deshalb kein vault_password_file in der ansible.cfg - sonst muesste die
+  Datei fuer Azure gepatcht werden. Der Pfad kommt immer per CLI-Flag.
+
+
+================================================================================
+10. FIREWALL
 ================================================================================
 
 # Nur aus dem internen Netz erreichbar machen:
 ufw allow from 192.168.1.0/24 to any port 3000 proto tcp
 ufw enable
 
+# Falls der Azure-Agent aus einem anderen Subnetz kommt, dessen IP fuer SSH
+# freigeben:
+ufw allow from <AGENT_IP> to any port 22 proto tcp
+
 # NICHT "ufw allow 3000" ohne Quell-Einschraenkung, solange HTTP laeuft.
 
 
 ================================================================================
-7. BETRIEB (auf dem Server als User "metabase")
+11. BETRIEB (auf dem Server als User "metabase")
 ================================================================================
 
 sudo -iu metabase
@@ -568,7 +945,7 @@ podman volume inspect metabase-pgdata
 
 
 ================================================================================
-8. BACKUP
+12. BACKUP
 ================================================================================
 
 podman exec metabase-postgres \
@@ -581,11 +958,12 @@ podman exec metabase-postgres \
   pg_restore -U metabase -d metabase --clean /tmp/mb.dump
 
 # WICHTIG: Backup ist ohne den MB_ENCRYPTION_SECRET_KEY wertlos.
-# Key sicher aufbewahren (er liegt im Vault - Vault-Passwort ebenfalls sichern).
+# Key liegt im Vault -> Vault-Passwort ebenfalls sichern (Passwortmanager),
+# NICHT nur in der Azure Variable group.
 
 
 ================================================================================
-9. SPAETER: HTTPS NACHRUESTEN
+13. SPAETER: HTTPS NACHRUESTEN
 ================================================================================
 
 Sobald ein DNS-Name existiert (z.B. metabase.kunde.de auf die Server-IP):
@@ -601,51 +979,76 @@ systemctl reload caddy
 
 # Dann in group_vars/all.yml:
 metabase_site_url: "https://metabase.kunde.de"
-# und Playbook erneut laufen lassen (rendert ConfigMap neu, restartet Pod).
+# (bzw. in Azure als Variable METABASE_SITE_URL setzen und per -e uebergeben)
+# Playbook erneut laufen lassen -> ConfigMap neu, Pod restart.
 
-# Port 3000 danach nach aussen dichtmachen:
+# Port 3000 nach aussen dichtmachen:
 ufw delete allow from 192.168.1.0/24 to any port 3000 proto tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 
-Caddy holt sich Let's Encrypt automatisch. Kein manuelles Zertifikat noetig.
-
 
 ================================================================================
-10. STOLPERFALLEN
+14. STOLPERFALLEN
 ================================================================================
 
-- MB_SITE_URL muss exakt zur aufgerufenen URL passen (inkl. Port und
-  http/https). Sonst: Redirect-Loops, kaputte E-Mail-Links, Pulse-Links
-  zeigen ins Leere.
+--- Ansible / Metabase ---
 
-- MB_ENCRYPTION_SECRET_KEY nach dem ersten Start NIE aendern. Alle in
-  Metabase gespeicherten DB-Passwoerter sind damit verschluesselt.
-  Aendern = alle Datenbankverbindungen neu einrichten.
+- MB_SITE_URL muss exakt zur aufgerufenen URL passen (inkl. Port, http/https).
+  Sonst: Redirect-Loops, kaputte E-Mail- und Pulse-Links.
 
-- Manifest-Datei enthaelt nach dem Rendern die Secrets im Klartext auf dem
-  Server (mode 0600, root + Service-User). Das ist bei "podman kube play"
-  unvermeidbar, da Podman kein externes Secret-Backend im Manifest kann.
-  Alternative: "podman secret create" + secretKeyRef auf Podman-Secrets -
-  funktioniert aber nur teilweise mit kube play.
+- MB_ENCRYPTION_SECRET_KEY nach dem ersten Start NIE aendern. Alle in Metabase
+  gespeicherten DB-Passwoerter sind damit verschluesselt.
 
-- no_log: true beim template-Task verhindert, dass Secrets im Ansible-Log
-  landen. Nicht entfernen.
+- Die gerenderte metabase.yaml enthaelt Secrets im Klartext auf dem Server
+  (0600, Service-User). Bei "podman kube play" unvermeidbar - Podman kann
+  kein externes Secret-Backend im Manifest.
 
-- Service/Ingress/StatefulSet werden von Podman ignoriert bzw. nicht
-  unterstuetzt. Deshalb Pod + hostPort + PVC.
+- no_log: true beim template-Task nicht entfernen, sonst stehen Secrets im
+  Ansible-Log und damit im Azure-Pipeline-Log.
+
+- Service/Ingress/StatefulSet werden von Podman ignoriert. Deshalb Pod +
+  hostPort + PVC.
 
 - readinessProbe wird von Podman nicht gemappt, nur livenessProbe.
-  Das Warten uebernimmt der uri-Health-Check im Playbook.
 
 - Rootless + Ports <1024 geht nicht ohne
-  sysctl net.ipv4.ip_unprivileged_port_start=80. Deshalb 3000 + Proxy.
+  sysctl net.ipv4.ip_unprivileged_port_start=80.
 
 - Ohne "loginctl enable-linger" stirbt der Pod beim Logout des Users.
 
 - Erststart dauert 60-180s (DB-Migrationen). Health-Check hat 5 min Puffer.
 
-- Externe Ziel-Datenbanken werden in der Metabase-UI unter
-  Admin > Databases verbunden - nicht hier im Manifest.
+--- Azure DevOps ---
+
+- Secure file UND Variable group brauchen BEIDE explizit "Pipeline permissions".
+  Ohne das: Task schlaegt mit Berechtigungsfehler fehl, ohne klare Meldung.
+
+- ANSIBLE_VAULT_PASSWORD muss als "secret" markiert sein (Schloss-Icon).
+  Sonst steht es im Log. Secret-Variablen werden NICHT automatisch als
+  Env-Var gemappt - deshalb der explizite "env:" Block im Task.
+
+- printf '%s' statt echo beim Schreiben der Vault-Passwortdatei: echo haengt
+  ein \n an. Ansible toleriert das meist, aber nicht garantiert.
+
+- Microsoft-hosted Agents erreichen interne Netze nicht. Bei internem
+  Zielserver zwingend self-hosted Agent oder Managed DevOps Pool mit VNet.
+
+- ssh-keyscan mit "|| true": schlaegt fehl, wenn der Host per Firewall
+  ICMP/SSH blockt - soll die Pipeline aber nicht killen.
+
+- Der Dry-Run meldet bei Erstinstallation Fehler, weil Pakete/User noch
+  fehlen und Folge-Tasks nicht simuliert werden koennen. Deshalb "|| echo".
+  Bei bestehender Installation ist der Check-Mode aussagekraeftig.
+
+- deployment-Job (statt job) ist Voraussetzung fuer "environment:" und damit
+  fuer Approvals.
+
+- Agent-Aufraeumen: Microsoft-hosted Agents werden verworfen, self-hosted
+  NICHT. Deshalb die rm-Schritte mit "condition: always()" - auf self-hosted
+  Agents wuerden Key und Vault-Passwort sonst liegenbleiben.
+
+- Externe Ziel-Datenbanken werden in der Metabase-UI unter Admin > Databases
+  verbunden - nicht hier im Manifest.
 
 ================================================================================
