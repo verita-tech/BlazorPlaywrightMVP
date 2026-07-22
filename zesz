@@ -1,0 +1,679 @@
+================================================================================
+BLAZOR WASM STANDALONE + ASP.NET CORE WEB API IN DOCKER (.NET 10)
+Visual Studio Setup mit Debugging
+================================================================================
+
+INHALT
+------
+ 1. Projektstruktur
+ 2. WebApi/Dockerfile
+ 3. WebApi/.dockerignore
+ 4. BlazorApp/Dockerfile
+ 5. BlazorApp/nginx.conf
+ 6. docker-compose.yml
+ 7. docker-compose.override.yml
+ 8. WebApi/Program.cs (CORS)
+ 9. WebApi/appsettings.Development.json
+10. BlazorApp/wwwroot/appsettings.json
+11. BlazorApp/Program.cs
+12. Debugging in Visual Studio
+13. Variante ohne CORS (nginx Reverse Proxy)
+14. Podman statt Docker Desktop
+15. Haeufige Stolpersteine
+
+
+================================================================================
+1. PROJEKTSTRUKTUR
+================================================================================
+
+/src
+  MySolution.sln
+  .dockerignore
+  docker-compose.yml
+  docker-compose.override.yml
+  /BlazorApp
+     BlazorApp.csproj
+     Program.cs
+     nginx.conf
+     Dockerfile
+     /wwwroot
+        index.html
+        appsettings.json
+  /WebApi
+     WebApi.csproj
+     Program.cs
+     appsettings.json
+     appsettings.Development.json
+     Dockerfile
+     /Controllers
+        WeatherController.cs
+
+Wichtig: docker-compose.yml liegt im Solution-Root. Der Build-Context ist "."
+also das Solution-Root, NICHT der jeweilige Projektordner. Sonst findet
+COPY die .csproj nicht.
+
+
+================================================================================
+2. WebApi/Dockerfile
+================================================================================
+
+# ---- base: diese Stage nutzt Visual Studio beim F5-Debugging ----
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+WORKDIR /app
+EXPOSE 8080
+
+# ---- build ----
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+ARG BUILD_CONFIGURATION=Debug
+WORKDIR /src
+COPY ["WebApi/WebApi.csproj", "WebApi/"]
+RUN dotnet restore "WebApi/WebApi.csproj"
+COPY . .
+WORKDIR "/src/WebApi"
+RUN dotnet build "WebApi.csproj" -c $BUILD_CONFIGURATION -o /app/build
+
+# ---- publish ----
+FROM build AS publish
+ARG BUILD_CONFIGURATION=Release
+RUN dotnet publish "WebApi.csproj" \
+    -c $BUILD_CONFIGURATION \
+    -o /app/publish \
+    /p:UseAppHost=false
+
+# ---- final ----
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app/publish .
+ENTRYPOINT ["dotnet", "WebApi.dll"]
+
+--------------------------------------------------------------------------------
+HINWEIS: "base" MUSS die erste Stage sein. Visual Studio startet beim
+Debuggen genau diese Stage und mountet den auf dem Host gebauten Code plus
+den vsdbg-Debugger als Volume hinein. Deshalb ist F5 schnell -- im Container
+wird beim Debuggen gar nicht kompiliert.
+
+Alternative Basis-Images (.NET 10):
+  mcr.microsoft.com/dotnet/aspnet:10.0              (Debian, Standard)
+  mcr.microsoft.com/dotnet/aspnet:10.0-alpine       (klein, musl)
+  mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled (minimal, kein Shell)
+
+Chiseled-Images sind fuer Produktion gut, fuer VS-Debugging aber
+ungeeignet (kein Shell, kein vsdbg). Fuer die base-Stage beim Debuggen
+das normale Image nehmen.
+
+
+================================================================================
+3. WebApi/.dockerignore  (bzw. .dockerignore im Solution-Root)
+================================================================================
+
+**/bin
+**/obj
+**/.vs
+**/.vscode
+**/node_modules
+**/.git
+**/.gitignore
+**/.dockerignore
+**/Dockerfile*
+**/docker-compose*
+**/*.user
+**/secrets.dev.yaml
+**/values.dev.yaml
+LICENSE
+README.md
+
+--------------------------------------------------------------------------------
+Ohne .dockerignore werden bin/ und obj/ vom Host in den Build-Context
+kopiert. Das ist nicht nur langsam, sondern fuehrt auch zu kaputten
+Builds, weil die Host-Artefakte mit denen im Container kollidieren.
+
+
+================================================================================
+4. BlazorApp/Dockerfile
+================================================================================
+
+# ---- build ----
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY ["BlazorApp/BlazorApp.csproj", "BlazorApp/"]
+RUN dotnet restore "BlazorApp/BlazorApp.csproj"
+COPY . .
+WORKDIR "/src/BlazorApp"
+RUN dotnet publish "BlazorApp.csproj" -c Release -o /app/publish
+
+# ---- final: statisches Hosting via nginx ----
+FROM nginx:alpine AS final
+WORKDIR /usr/share/nginx/html
+COPY --from=build /app/publish/wwwroot .
+COPY BlazorApp/nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+
+--------------------------------------------------------------------------------
+Blazor WASM Standalone ist reines Client-Side. Das Publish-Ergebnis unter
+publish/wwwroot sind nur statische Dateien (index.html, .wasm, .dll bzw.
+.wasm-Bundles, _framework/). Es laeuft KEINE .NET-Runtime im Container --
+die laeuft im Browser. Deshalb nginx statt aspnet als Basis-Image.
+
+
+================================================================================
+5. BlazorApp/nginx.conf
+================================================================================
+
+server {
+    listen 80;
+    server_name localhost;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Client-Side-Routing: jeder unbekannte Pfad geht an index.html,
+    # sonst 404 beim Reload auf einer Blazor-Route
+    location / {
+        try_files $uri $uri/ /index.html =404;
+    }
+
+    # MIME-Typen fuer WASM -- ohne das laedt die Runtime nicht
+    types {
+        text/html                             html htm;
+        text/css                              css;
+        application/javascript                js mjs;
+        application/wasm                      wasm;
+        application/octet-stream              dll pdb dat blat;
+        application/font-woff                 woff;
+        font/woff2                            woff2;
+        image/svg+xml                         svg;
+        image/png                             png;
+        application/json                      json;
+    }
+
+    # Kompression -- WASM-Payloads sind gross
+    gzip on;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types
+        text/css
+        text/plain
+        application/javascript
+        application/json
+        application/wasm
+        application/octet-stream
+        image/svg+xml;
+
+    # Vorkomprimierte Brotli-Dateien aus dem Publish nutzen,
+    # falls das ngx_brotli-Modul verfuegbar ist
+    # brotli_static on;
+
+    # Framework-Dateien sind content-hashed -> lange cachen
+    location /_framework/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # index.html und Konfiguration nie cachen
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+
+    location = /appsettings.json {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+}
+
+
+================================================================================
+6. docker-compose.yml
+================================================================================
+
+services:
+
+  webapi:
+    image: ${DOCKER_REGISTRY-}webapi
+    build:
+      context: .
+      dockerfile: WebApi/Dockerfile
+
+  blazorapp:
+    image: ${DOCKER_REGISTRY-}blazorapp
+    build:
+      context: .
+      dockerfile: BlazorApp/Dockerfile
+    depends_on:
+      - webapi
+
+--------------------------------------------------------------------------------
+Die "version:"-Zeile ist bei Compose v2 obsolet und kann weg.
+context ist "." (Solution-Root), dockerfile der relative Pfad dorthin.
+
+
+================================================================================
+7. docker-compose.override.yml
+================================================================================
+
+services:
+
+  webapi:
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_HTTP_PORTS=8080
+    ports:
+      - "5001:8080"
+
+  blazorapp:
+    ports:
+      - "5002:80"
+
+--------------------------------------------------------------------------------
+ASPNETCORE_HTTP_PORTS ist die aktuelle Variable (ersetzt das alte
+ASPNETCORE_URLS bzw. den 80er-Default aus .NET-5-Zeiten). Ab .NET 8 ist
+der Container-Default bereits 8080 und der Prozess laeuft als non-root
+User "app" -- deshalb kein Port unter 1024.
+
+Fuer HTTPS im Container zusaetzlich:
+
+  webapi:
+    environment:
+      - ASPNETCORE_HTTPS_PORTS=8081
+      - ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+      - ASPNETCORE_Kestrel__Certificates__Default__Path=/https/aspnetapp.pfx
+    ports:
+      - "5001:8080"
+      - "5443:8081"
+    volumes:
+      - ${APPDATA}/Microsoft/UserSecrets:/home/app/.microsoft/usersecrets:ro
+      - ${APPDATA}/ASP.NET/Https:/https:ro
+
+Zertifikat vorher einmalig erzeugen:
+  dotnet dev-certs https -ep %APPDATA%\ASP.NET\Https\aspnetapp.pfx -p devpassword
+  dotnet dev-certs https --trust
+
+
+================================================================================
+8. WebApi/Program.cs  (mit CORS)
+================================================================================
+
+var builder = WebApplication.CreateBuilder(args);
+
+const string CorsPolicy = "BlazorClient";
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(CorsPolicy, policy =>
+        policy.WithOrigins(
+                  "http://localhost:5002",   // Blazor im nginx-Container
+                  "https://localhost:7001",  // Blazor lokal via dotnet watch
+                  "http://localhost:5150")   // Blazor lokal http
+              .AllowAnyHeader()
+              .AllowAnyMethod());
+});
+
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+}
+
+app.UseCors(CorsPolicy);
+app.MapControllers();
+
+app.Run();
+
+--------------------------------------------------------------------------------
+UseCors MUSS vor MapControllers stehen, sonst greift die Policy nicht.
+
+Die Origins sind aus Browser-Sicht (localhost + Host-Port), nicht die
+Compose-Servicenamen. Der Browser laeuft ausserhalb des Docker-Netzwerks
+und kennt "webapi" nicht.
+
+AddOpenApi/MapOpenApi ist der eingebaute Ersatz fuer Swashbuckle seit
+.NET 9. Fuer eine UI zusaetzlich Scalar oder Swagger UI einbinden.
+
+Beispiel-Controller (WebApi/Controllers/WeatherController.cs):
+
+using Microsoft.AspNetCore.Mvc;
+
+namespace WebApi.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class WeatherController : ControllerBase
+{
+    private static readonly string[] Summaries =
+        ["Frostig", "Kuehl", "Mild", "Warm", "Heiss"];
+
+    [HttpGet]
+    public IEnumerable<WeatherForecast> Get() =>
+        Enumerable.Range(1, 5).Select(index => new WeatherForecast(
+            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
+            Random.Shared.Next(-20, 55),
+            Summaries[Random.Shared.Next(Summaries.Length)]));
+}
+
+public record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
+{
+    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
+}
+
+
+================================================================================
+9. WebApi/appsettings.Development.json
+================================================================================
+
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}
+
+
+================================================================================
+10. BlazorApp/wwwroot/appsettings.json
+================================================================================
+
+{
+  "ApiBaseUrl": "http://localhost:5001"
+}
+
+--------------------------------------------------------------------------------
+Diese Datei wird zur LAUFZEIT vom Browser geladen (nicht einkompiliert
+wie bei serverseitigem ASP.NET). Sie liegt im Image, kann aber beim
+Containerstart ersetzt werden -- siehe Abschnitt 15.
+
+
+================================================================================
+11. BlazorApp/Program.cs
+================================================================================
+
+using Microsoft.AspNetCore.Components.Web;
+using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
+using BlazorApp;
+
+var builder = WebAssemblyHostBuilder.CreateDefault(args);
+
+builder.RootComponents.Add<App>("#app");
+builder.RootComponents.Add<HeadOutlet>("head::after");
+
+var apiUrl = builder.Configuration["ApiBaseUrl"]
+             ?? builder.HostEnvironment.BaseAddress;
+
+builder.Services.AddScoped(sp => new HttpClient
+{
+    BaseAddress = new Uri(apiUrl)
+});
+
+await builder.Build().RunAsync();
+
+--------------------------------------------------------------------------------
+Der Fallback auf BaseAddress ist praktisch fuer die Reverse-Proxy-Variante
+(Abschnitt 13): dann liegt die API unter demselben Origin und die
+appsettings.json kann ganz entfallen.
+
+Verwendung in einer Komponente:
+
+@page "/wetter"
+@inject HttpClient Http
+
+@if (forecasts is null)
+{
+    <p>Laden...</p>
+}
+else
+{
+    <ul>
+    @foreach (var f in forecasts)
+    {
+        <li>@f.Date.ToShortDateString(): @f.TemperatureC C -- @f.Summary</li>
+    }
+    </ul>
+}
+
+@code {
+    private WeatherForecast[]? forecasts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        forecasts = await Http.GetFromJsonAsync<WeatherForecast[]>(
+            "api/weather");
+    }
+
+    public record WeatherForecast(
+        DateOnly Date, int TemperatureC, string? Summary);
+}
+
+
+================================================================================
+12. DEBUGGING IN VISUAL STUDIO
+================================================================================
+
+EINRICHTUNG
+-----------
+1. Rechtsklick auf WebApi -> Hinzufuegen -> Container-Unterstuetzung -> Linux
+   (erzeugt das Dockerfile; falls du es manuell anlegst, entfaellt das)
+2. Rechtsklick auf WebApi -> Hinzufuegen -> Containerorchestrator-
+   Unterstuetzung -> Docker Compose
+3. Dasselbe fuer BlazorApp -> beide landen in derselben docker-compose.yml
+4. Im Solution Explorer "docker-compose" als Startprojekt setzen
+5. F5
+
+WAS BEIM API-DEBUGGING PASSIERT
+-------------------------------
+Visual Studio baut das Projekt auf dem HOST (nicht im Container), startet
+den Container aus der "base"-Stage und mountet:
+  - den Output-Ordner (bin/Debug/net10.0) nach /app
+  - den vsdbg-Debugger nach /remote_debugger
+Dann wird der Prozess unter vsdbg gestartet. Breakpoints, Watch-Fenster,
+Step-Through, Hot Reload -- alles funktioniert wie bei lokalem Debugging.
+
+Pruefen, ob das laeuft:
+  docker ps
+  docker inspect <container> --format "{{json .Mounts}}"
+
+BLAZOR WASM DEBUGGING
+---------------------
+Im nginx-Container ist Blazor NICHT mit VS debuggbar. Es laeuft dort kein
+.NET-Prozess, an den sich vsdbg haengen koennte.
+
+Empfohlener Workflow fuer die aktive Entwicklung:
+
+  Terminal 1 (API im Container):
+    docker compose up webapi
+
+  Terminal 2 (Blazor lokal):
+    cd BlazorApp
+    dotnet watch
+
+  -> Breakpoints in der Blazor-App per Browser-Debugging (Chrome/Edge
+     DevTools, Tab "Sources", Ordner "file://"), oder in VS ueber
+     Debuggen -> Prozess anhaengen -> Browser.
+  -> Hot Reload funktioniert.
+  -> Der nginx-Container wird dann nur fuer Integrationstests bzw.
+     produktionsnahe Verifikation gebaut.
+
+Voraussetzung fuer Browser-Debugging von WASM: im .csproj muss
+  <DebuggerSupport>true</DebuggerSupport>
+in Debug-Builds aktiv sein (ist per Default so) und die
+_framework/*.pdb-Dateien muessen ausgeliefert werden.
+
+
+================================================================================
+13. VARIANTE OHNE CORS (nginx als Reverse Proxy)
+================================================================================
+
+Wenn Blazor und API unter demselben Origin ausgeliefert werden, entfaellt
+CORS komplett -- weniger Konfiguration, naeher an Produktion.
+
+BlazorApp/nginx.conf (Ergaenzung im server-Block):
+
+    # API-Aufrufe an den webapi-Service durchreichen
+    location /api/ {
+        proxy_pass         http://webapi:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+    }
+
+Hier IST "webapi" korrekt -- nginx laeuft innerhalb des Docker-Netzwerks
+und loest den Servicenamen ueber Docker DNS auf.
+
+Dann in BlazorApp/Program.cs:
+
+    builder.Services.AddScoped(sp => new HttpClient
+    {
+        BaseAddress = new Uri(builder.HostEnvironment.BaseAddress)
+    });
+
+Die appsettings.json mit ApiBaseUrl und der CORS-Block in der API
+koennen entfallen. Der Port 5001 muss dann auch nicht mehr nach aussen
+gemappt werden.
+
+
+================================================================================
+14. PODMAN STATT DOCKER DESKTOP
+================================================================================
+
+Docker Compose und Visual Studio sprechen ueber die Docker-API. Podman
+bringt einen kompatiblen Socket mit.
+
+Linux (rootless):
+    systemctl --user enable --now podman.socket
+    export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
+
+Windows (Podman Desktop / podman machine):
+    podman machine init
+    podman machine start
+    podman system connection list
+    -> DOCKER_HOST auf den npipe-Pfad setzen, z. B.
+       npipe:////./pipe/podman-machine-default
+
+Compose ueber Podman:
+    podman compose up
+  oder docker-compose gegen den Podman-Socket:
+    DOCKER_HOST=... docker compose up
+
+Einschraenkungen: Das automatische Debugger-Mounting von Visual Studio
+funktioniert mit Podman nicht immer zuverlaessig. Wenn F5-Debugging
+klemmt, laeuft der Weg ueber "Debuggen -> An Prozess anhaengen" mit
+manuell installiertem vsdbg im Container.
+
+Rootless Podman: Ports unter 1024 sind nicht bindbar. Da .NET 10 ohnehin
+auf 8080 laeuft, ist das hier kein Problem -- aber der nginx-Container
+mit EXPOSE 80 braucht ein Host-Mapping oberhalb 1024 (5002:80 passt).
+
+
+================================================================================
+15. HAEUFIGE STOLPERSTEINE
+================================================================================
+
+BUILD-CONTEXT
+  COPY findet die .csproj nicht
+  -> context muss "." (Solution-Root) sein, nicht der Projektordner.
+     Der Pfad im COPY ist relativ zum Context.
+
+BASE-STAGE-REIHENFOLGE
+  VS-Debugging startet nicht oder baut jedes Mal komplett neu
+  -> "base" muss die erste Stage im Dockerfile sein.
+
+FEHLENDE .dockerignore
+  Build ist langsam, Fehler wie "Assembly bereits geladen"
+  -> bin/ und obj/ ausschliessen.
+
+CORS-ORIGIN FALSCH
+  Browser-Konsole: "blocked by CORS policy"
+  -> Origin ist die HOST-Adresse (http://localhost:5002), nicht der
+     Compose-Servicename. Und: Port und Schema muessen exakt passen,
+     http != https, 5002 != 5002/.
+
+WASM MIME-TYPE
+  App bleibt beim Ladebildschirm haengen, Konsole meldet
+  "Incorrect response MIME type"
+  -> application/wasm im nginx types-Block ergaenzen.
+
+BLAZOR-ROUTING 404
+  Direkter Aufruf von /wetter oder F5 auf einer Unterseite gibt 404
+  -> try_files $uri $uri/ /index.html =404;
+
+APPSETTINGS ZUR BUILD-ZEIT EINGEBACKEN
+  wwwroot/appsettings.json liegt fest im Image, unterschiedliche
+  Umgebungen brauchen unterschiedliche API-URLs.
+  Loesung A -- Entrypoint-Skript mit envsubst:
+
+    # in BlazorApp/Dockerfile ergaenzen:
+    COPY BlazorApp/entrypoint.sh /entrypoint.sh
+    RUN chmod +x /entrypoint.sh
+    ENTRYPOINT ["/entrypoint.sh"]
+    CMD ["nginx", "-g", "daemon off;"]
+
+    # BlazorApp/entrypoint.sh:
+    #!/bin/sh
+    set -e
+    cat > /usr/share/nginx/html/appsettings.json <<EOF
+    { "ApiBaseUrl": "${API_BASE_URL:-http://localhost:5001}" }
+    EOF
+    exec "$@"
+
+    # docker-compose.override.yml:
+    blazorapp:
+      environment:
+        - API_BASE_URL=http://localhost:5001
+
+  Loesung B -- Reverse Proxy (Abschnitt 13), dann entfaellt das Problem.
+
+DEPENDS_ON GARANTIERT KEINE BEREITSCHAFT
+  depends_on wartet nur auf Container-Start, nicht auf "App ist bereit".
+  Fuer echtes Warten: healthcheck in der API definieren und
+  depends_on mit condition: service_healthy.
+
+    webapi:
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+        interval: 10s
+        timeout: 3s
+        retries: 5
+        start_period: 10s
+
+    blazorapp:
+      depends_on:
+        webapi:
+          condition: service_healthy
+
+  Dafuer in der API app.MapHealthChecks("/health") ergaenzen und
+  builder.Services.AddHealthChecks() registrieren. Achtung: die
+  chiseled-Images haben kein curl -- dort stattdessen den eingebauten
+  dotnet-Healthcheck oder ein aspnet-Image mit Shell nehmen.
+
+NON-ROOT USER
+  Ab .NET 8 laufen die Container als User "app" (UID 1654). Schreibende
+  Zugriffe auf /app schlagen fehl. Falls noetig, im Dockerfile explizit
+  USER root setzen -- besser aber ein beschreibbares Volume mounten.
+
+HTTPS-ZERTIFIKAT IM CONTAINER
+  "The SSL connection could not be established"
+  -> dev-certs exportieren und mounten (siehe Abschnitt 7), oder im
+     Container nur HTTP nutzen und TLS am Reverse Proxy terminieren.
+     Letzteres entspricht auch der Produktionsrealitaet.
+
+
+================================================================================
+SCHNELLSTART
+================================================================================
+
+    cd src
+    docker compose build
+    docker compose up
+
+    Blazor:  http://localhost:5002
+    API:     http://localhost:5001/api/weather
+    OpenAPI: http://localhost:5001/openapi/v1.json
+
+Debugging: docker-compose als Startprojekt in VS, F5.
+
+================================================================================
