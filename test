@@ -1,6 +1,6 @@
 ===============================================================
- Talk to Data - Blazor Server (.NET 10) + Metabase built-in MCP
- Lokale KI via Ollama. Aktuelle Paketversionen.
+ Talk to Data - Blazor Server (.NET 10) + Fluent UI 4.14.4
+ Metabase MCP (OAuth), lokale KI via Ollama, TLS-Bypass optional.
  Jede Datei beginnt mit:  ===== FILE: <pfad> =====
 ===============================================================
 
@@ -21,6 +21,8 @@
     <PackageReference Include="Microsoft.Extensions.AI" Version="10.9.0" />
     <!-- Local LLM via Ollama (implements IChatClient) -->
     <PackageReference Include="OllamaSharp" Version="5.4.30" />
+    <!-- Fluent UI Blazor components -->
+    <PackageReference Include="Microsoft.FluentUI.AspNetCore.Components" Version="4.14.4" />
   </ItemGroup>
 
 </Project>
@@ -35,18 +37,17 @@
     }
   },
   "AllowedHosts": "*",
-
   "Ollama": {
     "Endpoint": "http://localhost:11434",
     "Model": "mistral-nemo"
   },
-
   "MetabaseMcp": {
     "Endpoint": "https://your-metabase.example.com/api/mcp",
-    "ApiKey": "mb_REPLACE_ME"
+    "ClientName": "TalkToData",
+    "RedirectUri": "https://localhost:7123/oauth/callback",
+    "IgnoreSslErrors": false
   }
 }
-
 
 ===== FILE: Program.cs =====
 using TalkToData.Components;
@@ -60,7 +61,15 @@ builder.Services.AddRazorComponents()
 builder.Services.Configure<OllamaOptions>(builder.Configuration.GetSection("Ollama"));
 builder.Services.Configure<MetabaseMcpOptions>(builder.Configuration.GetSection("MetabaseMcp"));
 
-// One MCP/Anthropic connection per circuit (user session) is a sensible default.
+// Singleton: the OAuth callback arrives on a separate HTTP request and must
+// reach the same coordinator that the MCP client is waiting on.
+builder.Services.AddSingleton<MetabaseOAuthCoordinator>();
+
+// One MCP + chat connection per circuit (user session).
+// Fluent UI Blazor requires a default HttpClient registered before AddFluentUIComponents.
+builder.Services.AddHttpClient();
+builder.Services.AddFluentUIComponents();
+
 builder.Services.AddScoped<TalkToDataService>();
 
 var app = builder.Build();
@@ -75,6 +84,25 @@ app.UseHttpsRedirection();
 app.UseAntiforgery();
 app.MapStaticAssets();
 
+// OAuth redirect endpoint. Metabase sends the browser here after consent.
+app.MapGet("/oauth/callback", (HttpContext ctx, MetabaseOAuthCoordinator oauth) =>
+{
+    var code = ctx.Request.Query["code"].ToString();
+    var state = ctx.Request.Query["state"].ToString();
+    var iss = ctx.Request.Query["iss"].ToString();
+
+    if (string.IsNullOrEmpty(code) || string.IsNullOrEmpty(state))
+        return Results.Content("<h3>Anmeldung fehlgeschlagen: fehlender Code/State.</h3>", "text/html");
+
+    Uri? issuer = Uri.TryCreate(iss, UriKind.Absolute, out var u) ? u : null;
+    var ok = oauth.CompleteAuthorization(state, code, issuer);
+
+    var msg = ok
+        ? "<h3>Anmeldung erfolgreich.</h3><p>Du kannst dieses Fenster schlie&szlig;en und zur App zur&uuml;ckkehren.</p>"
+        : "<h3>Anmeldung konnte nicht zugeordnet werden.</h3><p>Bitte in der App erneut versuchen.</p>";
+    return Results.Content($"<!doctype html><meta charset='utf-8'>{msg}", "text/html");
+});
+
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
 
@@ -88,6 +116,7 @@ app.Run();
 @using Microsoft.AspNetCore.Components.Routing
 @using Microsoft.AspNetCore.Components.Web
 @using Microsoft.JSInterop
+@using Microsoft.FluentUI.AspNetCore.Components
 @using TalkToData
 @using TalkToData.Components
 @using TalkToData.Services
@@ -107,12 +136,66 @@ public sealed class OllamaOptions
 
 public sealed class MetabaseMcpOptions
 {
-    // Built-in Metabase MCP server (Metabase 60+), Streamable HTTP transport.
+    // Built-in Metabase MCP server, Streamable HTTP transport.
     // e.g. https://your-metabase.example.com/api/mcp
     public string Endpoint { get; set; } = "";
 
-    // Metabase API key. Sent as x-api-key.
-    public string ApiKey { get; set; } = "";
+    // OAuth (Dynamic Client Registration): no ClientId needed, the SDK registers itself.
+    public string ClientName { get; set; } = "TalkToData";
+
+    // Must match a redirect endpoint served by this app, e.g.
+    // https://localhost:7123/oauth/callback
+    public string RedirectUri { get; set; } = "";
+
+    // DANGER: skip TLS certificate validation for the Metabase connection
+    // (self-signed / internal CA). Never enable in production.
+    public bool IgnoreSslErrors { get; set; }
+}
+
+
+===== FILE: Services/MetabaseOAuth.cs =====
+using System.Collections.Concurrent;
+
+namespace TalkToData.Services;
+
+/// <summary>
+/// Coordinates the OAuth authorization-code round trip between the MCP client
+/// (which needs an auth code) and the browser (which lands on /oauth/callback).
+///
+/// Flow:
+///  1. MCP SDK calls RequestAuthorizationAsync(authUrl) with Metabase's consent URL.
+///  2. We store a pending TaskCompletionSource keyed by the OAuth `state`, and
+///     hand the consent URL to the UI so it can redirect the user's browser.
+///  3. Metabase redirects back to /oauth/callback?code=...&state=...&iss=...
+///  4. CompleteAuthorization(...) resolves the TCS; the SDK continues the flow.
+/// </summary>
+public sealed class MetabaseOAuthCoordinator
+{
+    public sealed record AuthResult(string Code, string? State, Uri? Issuer);
+
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<AuthResult>> _pending = new();
+
+    // Raised when a consent URL is ready; the Blazor page subscribes and redirects.
+    public event Func<Uri, Task>? OnConsentUrlReady;
+
+    public async Task<AuthResult> WaitForCodeAsync(Uri authorizationUrl, string state, CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource<AuthResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[state] = tcs;
+
+        if (OnConsentUrlReady is not null)
+            await OnConsentUrlReady.Invoke(authorizationUrl);
+
+        using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
+        return await tcs.Task;
+    }
+
+    public bool CompleteAuthorization(string state, string code, Uri? issuer)
+    {
+        if (_pending.TryRemove(state, out var tcs))
+            return tcs.TrySetResult(new AuthResult(code, state, issuer));
+        return false;
+    }
 }
 
 
@@ -120,6 +203,7 @@ public sealed class MetabaseMcpOptions
 using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
+using ModelContextProtocol.Authentication;
 using ModelContextProtocol.Client;
 using OllamaSharp;
 
@@ -139,22 +223,25 @@ public sealed class TalkToDataService : IAsyncDisposable
 {
     private readonly OllamaOptions _ollama;
     private readonly MetabaseMcpOptions _mb;
+    private readonly MetabaseOAuthCoordinator _oauth;
     private readonly ILogger<TalkToDataService> _log;
 
     private McpClient? _mcp;
     private IChatClient? _chat;
     private IList<McpClientTool>? _mcpTools;
+    private HttpClient? _httpClient;
 
-    // Captures tabular payload seen from MCP tools during the current turn.
     private DataAnswer? _current;
 
     public TalkToDataService(
         IOptions<OllamaOptions> ollama,
         IOptions<MetabaseMcpOptions> mb,
+        MetabaseOAuthCoordinator oauth,
         ILogger<TalkToDataService> log)
     {
         _ollama = ollama.Value;
         _mb = mb.Value;
+        _oauth = oauth;
         _log = log;
     }
 
@@ -162,25 +249,49 @@ public sealed class TalkToDataService : IAsyncDisposable
     {
         if (_mcp is not null) return;
 
-        // Streamable HTTP transport to Metabase's built-in MCP endpoint.
-        var transport = new HttpClientTransport(new HttpClientTransportOptions
+        // Optional TLS bypass for self-signed / internal-CA Metabase instances.
+        var httpHandler = new HttpClientHandler();
+        if (_mb.IgnoreSslErrors)
         {
-            Name = "Metabase",
-            Endpoint = new Uri(_mb.Endpoint),
-            TransportMode = HttpTransportMode.AutoDetect,
-            AdditionalHeaders = new Dictionary<string, string>
+            _log.LogWarning("TLS certificate validation is DISABLED for the Metabase connection.");
+            httpHandler.ServerCertificateCustomValidationCallback =
+                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+        }
+        _httpClient = new HttpClient(httpHandler);
+
+        var oauthOptions = new ClientOAuthOptions
+        {
+            ClientName = _mb.ClientName,
+            RedirectUri = new Uri(_mb.RedirectUri),
+            // Metabase uses Dynamic Client Registration, so no ClientId is set here.
+            // SDK 2.x: use AuthorizationCallbackHandler (AuthorizationRedirectDelegate is deprecated).
+            AuthorizationCallbackHandler = async (authUrl, redirectUri, ct2) =>
             {
-                ["x-api-key"] = _mb.ApiKey
+                // Extract the `state` we must round-trip back from the browser.
+                var query = System.Web.HttpUtility.ParseQueryString(authUrl.Query);
+                var state = query["state"] ?? Guid.NewGuid().ToString("N");
+
+                var result = await _oauth.WaitForCodeAsync(authUrl, state, ct2);
+                return new AuthorizationCallbackResult(result.Code, result.State, result.Issuer);
             }
-        });
+        };
+
+        // Streamable HTTP transport to Metabase's built-in MCP endpoint, with the
+        // (optionally cert-ignoring) HttpClient and OAuth attached.
+        var transport = new HttpClientTransport(
+            new HttpClientTransportOptions
+            {
+                Name = "Metabase",
+                Endpoint = new Uri(_mb.Endpoint),
+                TransportMode = HttpTransportMode.AutoDetect,
+                OAuth = oauthOptions
+            },
+            _httpClient);
 
         _mcp = await McpClient.CreateAsync(transport, cancellationToken: ct);
         _mcpTools = await _mcp.ListToolsAsync(cancellationToken: ct);
 
-        // Local Ollama as the chat client. FunctionInvocation runs the tool loop;
-        // our middleware sniffs each tool result for a chartable table.
         var ollama = new OllamaApiClient(new Uri(_ollama.Endpoint), _ollama.Model);
-
         _chat = new ChatClientBuilder(ollama)
             .Use(inner => new TableSniffingChatClient(inner, () => _current))
             .UseFunctionInvocation()
@@ -214,7 +325,6 @@ public sealed class TalkToDataService : IAsyncDisposable
 
             var options = new ChatOptions
             {
-                // McpClientTool derives from AIFunction, so tools pass straight through.
                 Tools = [.. _mcpTools!],
                 ModelId = _ollama.Model,
                 Temperature = 0.1f
@@ -312,13 +422,13 @@ public sealed class TalkToDataService : IAsyncDisposable
     {
         if (_mcp is not null) await _mcp.DisposeAsync();
         if (_chat is IDisposable d) d.Dispose();
+        _httpClient?.Dispose();
     }
 }
 
 /// <summary>
 /// Delegating chat client that inspects tool-result messages flowing back
 /// through the pipeline and extracts a chartable table from their content.
-/// Sits below UseFunctionInvocation so it sees FunctionResultContent.
 /// </summary>
 internal sealed class TableSniffingChatClient : DelegatingChatClient
 {
@@ -371,11 +481,13 @@ internal sealed class TableSniffingChatClient : DelegatingChatClient
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Talk to Data</title>
     <base href="/" />
+    <link rel="stylesheet" href="_content/Microsoft.FluentUI.AspNetCore.Components/css/reboot.css" />
     <link rel="stylesheet" href="app.css" />
     <HeadOutlet />
 </head>
 <body>
     <Routes />
+    <script src="_content/Microsoft.FluentUI.AspNetCore.Components/Microsoft.FluentUI.AspNetCore.Components.lib.module.js" type="module" async></script>
     <script src="_framework/blazor.web.js"></script>
 </body>
 </html>
@@ -393,9 +505,23 @@ internal sealed class TableSniffingChatClient : DelegatingChatClient
 ===== FILE: Components/Layout/MainLayout.razor =====
 @inherits LayoutComponentBase
 
-<main class="shell">
-    @Body
-</main>
+<FluentLayout>
+    <FluentHeader>
+        Talk to Data
+    </FluentHeader>
+    <FluentBodyContent>
+        <div class="shell">
+            @Body
+        </div>
+    </FluentBodyContent>
+</FluentLayout>
+
+@* Providers required by Fluent UI services (toasts, dialogs, tooltips, message bars, menus). *@
+<FluentToastProvider />
+<FluentDialogProvider />
+<FluentTooltipProvider />
+<FluentMessageBarProvider />
+<FluentMenuProvider />
 
 
 ===== FILE: Components/BarChart.razor =====
@@ -473,92 +599,124 @@ internal sealed class TableSniffingChatClient : DelegatingChatClient
 @page "/"
 @rendermode InteractiveServer
 @inject TalkToDataService Data
+@inject MetabaseOAuthCoordinator OAuth
+@inject IJSRuntime JS
+@implements IDisposable
 
 <PageTitle>Talk to Data</PageTitle>
 
 <h1>Talk to Data</h1>
 <p class="sub">Frag deine Metabase-Daten in normaler Sprache. Antwort als Text oder Diagramm.</p>
 
-<div class="ask">
-    <input @bind="_question" @bind:event="oninput" @onkeydown="OnKey"
-           placeholder="z. B. Umsatz pro Monat in den letzten 6 Monaten" />
-    <button @onclick="Ask" disabled="@_busy">
-        @(_busy ? "Frage läuft…" : "Fragen")
-    </button>
-</div>
+<FluentStack Orientation="Orientation.Horizontal" VerticalAlignment="VerticalAlignment.Center" HorizontalGap="8">
+    <FluentTextField @bind-Value="_question" @onkeydown="OnKey"
+                     Placeholder="z. B. Umsatz pro Monat in den letzten 6 Monaten"
+                     Style="flex:1;" Disabled="_busy" />
+    <FluentButton Appearance="Appearance.Accent" OnClick="Ask" Disabled="_busy" Loading="_busy">
+        Fragen
+    </FluentButton>
+</FluentStack>
 
-@if (_busy)
+@if (_consentUrl is not null)
 {
-    <div class="hint">Metabase wird über MCP abgefragt…</div>
+    <FluentMessageBar Intent="MessageIntent.Warning" Title="Metabase-Anmeldung nötig" Style="margin-top:16px;">
+        Falls sich kein Fenster öffnet:
+        <FluentAnchor Href="@_consentUrl" Target="_blank" Appearance="Appearance.Hypertext">hier anmelden</FluentAnchor>.
+    </FluentMessageBar>
+}
+else if (_busy)
+{
+    <FluentStack Orientation="Orientation.Horizontal" VerticalAlignment="VerticalAlignment.Center"
+                 HorizontalGap="8" Style="margin-top:16px;">
+        <FluentProgressRing Width="20px" />
+        <span class="sub">Metabase wird über MCP abgefragt…</span>
+    </FluentStack>
 }
 
 @if (_answer is not null)
 {
     @if (_answer.Error is not null)
     {
-        <div class="error">
-            <strong>Fehler:</strong> @_answer.Error
-        </div>
+        <FluentMessageBar Intent="MessageIntent.Error" Title="Fehler" Style="margin-top:16px;">
+            @_answer.Error
+        </FluentMessageBar>
     }
     else
     {
         @if (!string.IsNullOrWhiteSpace(_answer.Text))
         {
-            <div class="answer">@_answer.Text</div>
+            <FluentCard Style="margin-top:16px;">
+                <p style="white-space:pre-wrap;margin:0;">@_answer.Text</p>
+            </FluentCard>
         }
 
         @if (_answer.HasTable)
         {
-            <div class="toggle">
-                <button class="@(_view == View.Chart ? "on" : "")" @onclick="() => _view = View.Chart">Diagramm</button>
-                <button class="@(_view == View.Table ? "on" : "")" @onclick="() => _view = View.Table">Tabelle</button>
-            </div>
-
-            @if (_view == View.Chart)
-            {
-                <BarChart Columns="_answer.Columns" Rows="_answer.Rows" />
-            }
-            else
-            {
-                <div class="tablewrap">
-                    <table>
-                        <thead>
-                            <tr>@foreach (var c in _answer.Columns) { <th>@c</th> }</tr>
-                        </thead>
-                        <tbody>
-                            @foreach (var r in _answer.Rows)
-                            {
-                                <tr>@foreach (var cell in r) { <td>@cell</td> }</tr>
-                            }
-                        </tbody>
-                    </table>
-                </div>
-            }
+            <FluentTabs @bind-ActiveTabId="_activeTab" Style="margin-top:16px;">
+                <FluentTab Id="chart" Label="Diagramm">
+                    <BarChart Columns="_answer.Columns" Rows="_answer.Rows" />
+                </FluentTab>
+                <FluentTab Id="table" Label="Tabelle">
+                    <FluentDataGrid Items="@GridRows" GridTemplateColumns="@GridTemplate">
+                        @for (var i = 0; i < _answer.Columns.Count; i++)
+                        {
+                            var idx = i;
+                            <TemplateColumn Title="@_answer.Columns[idx]" Context="row">
+                                @(row.Cells.ElementAtOrDefault(idx))
+                            </TemplateColumn>
+                        }
+                    </FluentDataGrid>
+                </FluentTab>
+            </FluentTabs>
         }
     }
 }
 
 @code {
-    private enum View { Chart, Table }
-
     private string _question = "";
     private bool _busy;
     private DataAnswer? _answer;
-    private View _view = View.Chart;
+    private string _activeTab = "chart";
+    private string? _consentUrl;
+
+    private sealed record GridRow(object?[] Cells);
+
+    private IQueryable<GridRow> GridRows =>
+        (_answer?.Rows ?? new()).Select(r => new GridRow(r.ToArray())).AsQueryable();
+
+    private string GridTemplate =>
+        string.Join(" ", Enumerable.Repeat("1fr", _answer?.Columns.Count ?? 1));
+
+    protected override void OnInitialized()
+    {
+        OAuth.OnConsentUrlReady += HandleConsentUrl;
+    }
+
+    private async Task HandleConsentUrl(Uri url)
+    {
+        _consentUrl = url.ToString();
+        await InvokeAsync(async () =>
+        {
+            StateHasChanged();
+            await JS.InvokeVoidAsync("window.open", _consentUrl, "_blank", "noopener");
+        });
+    }
 
     private async Task Ask()
     {
         if (string.IsNullOrWhiteSpace(_question) || _busy) return;
         _busy = true;
         _answer = null;
+        _consentUrl = null;
         try
         {
             _answer = await Data.AskAsync(_question);
-            _view = _answer.HasTable ? View.Chart : View.Table;
+            _activeTab = _answer.HasTable ? "chart" : "table";
         }
         finally
         {
             _busy = false;
+            _consentUrl = null;
         }
     }
 
@@ -566,150 +724,101 @@ internal sealed class TableSniffingChatClient : DelegatingChatClient
     {
         if (e.Key == "Enter") await Ask();
     }
+
+    public void Dispose()
+    {
+        OAuth.OnConsentUrlReady -= HandleConsentUrl;
+    }
 }
 
 
 ===== FILE: wwwroot/app.css =====
-:root {
-    --bg: #0f1115;
-    --panel: #171a21;
-    --line: #262b36;
-    --text: #e6e9ef;
-    --muted: #9aa4b2;
-    --accent: #4f9cf9;
-    --bar: #4f9cf9;
-}
-
-* { box-sizing: border-box; }
-
-body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-}
+/* Fluent UI supplies the base design system; only page-specific tweaks here. */
 
 .shell {
-    max-width: 820px;
+    max-width: 860px;
     margin: 0 auto;
-    padding: 48px 20px 80px;
+    padding: 32px 20px 80px;
 }
 
-h1 { font-size: 28px; margin: 0 0 4px; }
-.sub { color: var(--muted); margin: 0 0 24px; }
-
-.ask { display: flex; gap: 8px; }
-
-.ask input {
-    flex: 1;
-    padding: 12px 14px;
-    border-radius: 8px;
-    border: 1px solid var(--line);
-    background: var(--panel);
-    color: var(--text);
-    font-size: 15px;
-}
-.ask input:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
-
-.ask button {
-    padding: 12px 18px;
-    border-radius: 8px;
-    border: none;
-    background: var(--accent);
-    color: #06111f;
-    font-weight: 600;
-    cursor: pointer;
-}
-.ask button:disabled { opacity: .6; cursor: default; }
-
-.hint { color: var(--muted); margin-top: 14px; }
-
-.answer {
-    margin-top: 22px;
-    padding: 16px 18px;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    white-space: pre-wrap;
+h1 {
+    font-size: var(--type-ramp-plus-4-font-size, 28px);
+    margin: 0 0 4px;
 }
 
-.error {
-    margin-top: 22px;
-    padding: 14px 16px;
-    border: 1px solid #6b2b2b;
-    background: #2a1717;
-    border-radius: 10px;
-    color: #ffb4b4;
+.sub {
+    color: var(--neutral-foreground-hint, #6b6b6b);
+    margin: 0 0 24px;
 }
 
-.toggle { display: flex; gap: 6px; margin: 20px 0 12px; }
-.toggle button {
-    padding: 6px 14px;
-    border-radius: 999px;
-    border: 1px solid var(--line);
-    background: transparent;
-    color: var(--muted);
-    cursor: pointer;
+/* Dependency-free SVG bar chart, themed via Fluent design tokens. */
+.chart {
+    width: 100%;
+    height: auto;
+    margin-top: 8px;
 }
-.toggle button.on { background: var(--accent); color: #06111f; border-color: var(--accent); }
-
-.chart { width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
-.chart .bar { fill: var(--bar); }
-.chart .lbl { fill: var(--muted); font-size: 11px; }
-.chart .val { fill: var(--text); font-size: 11px; }
-
-.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); }
-th { background: var(--panel); color: var(--muted); font-weight: 600; }
+.chart .bar { fill: var(--accent-fill-rest, #0f6cbd); }
+.chart .lbl { fill: var(--neutral-foreground-hint, #6b6b6b); font-size: 11px; }
+.chart .val { fill: var(--neutral-foreground-rest, #242424); font-size: 11px; }
 
 
 ===== FILE: README.md =====
 # Talk to Data (Blazor Server, .NET 10)
 
-Blazor-Server-Seite, die per **Metabase built-in MCP-Server** (Metabase 60+) Fragen in
-natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Diagramm** darstellt.
-Das Sprachmodell läuft **lokal über Ollama** — keine Cloud-KI.
+Blazor-Server-Seite, die per **Metabase built-in MCP-Server** Fragen in natürlicher
+Sprache beantwortet und Ergebnisse **textlich oder als Diagramm** darstellt.
+Sprachmodell **lokal über Ollama**. MCP-Anmeldung per **OAuth 2.0**.
 
-## Paketversionen (aktuell)
-- `ModelContextProtocol` **2.2.0**  (MCP-Client, v2.x-API)
-- `Microsoft.Extensions.AI` **10.9.0**  (Chat + Function-Calling-Loop)
-- `OllamaSharp` **5.4.30**  (lokales Ollama als IChatClient)
+## Paketversionen
+- `ModelContextProtocol` 2.2.0 · `Microsoft.Extensions.AI` 10.9.0 · `OllamaSharp` 5.4.30
+- `Microsoft.FluentUI.AspNetCore.Components` 4.14.4 (UI)
 
-## Architektur
-- `TalkToDataService` verbindet sich per **Streamable HTTP** (`HttpClientTransport`,
-  `HttpTransportMode.AutoDetect`) mit dem Metabase-MCP-Endpoint (`/api/mcp`) und listet
-  dessen Tools (`search`, `construct_query`, `execute_query`, `execute_sql`, ...).
-- `McpClientTool` leitet von `AIFunction` ab und wird direkt als `ChatOptions.Tools`
-  übergeben. `UseFunctionInvocation()` fährt die Tool-Loop gegen das lokale Ollama-Modell.
-- Ein `DelegatingChatClient` (`TableSniffingChatClient`) unterhalb der Function-Invocation
-  liest `FunctionResultContent` mit und extrahiert eine chartbare Tabelle
-  (Metabase `data.cols`/`data.rows` oder Array von Objekten).
-- Die Page zeigt Antworttext + Umschalter **Diagramm / Tabelle** (abhängigkeitsfreies SVG).
+## Fluent UI Setup
+- `reboot.css` + Fluent JS-Modul in `App.razor` eingebunden.
+- Blazor Server: Default-`HttpClient` (`AddHttpClient()`) **vor** `AddFluentUIComponents()`.
+- Provider (`FluentToastProvider`, `-Dialog`, `-Tooltip`, `-MessageBar`, `-Menu`) am Ende
+  von `MainLayout.razor`.
+- UI: `FluentTextField`/`FluentButton` (Eingabe), `FluentMessageBar` (Fehler/OAuth-Hinweis),
+  `FluentProgressRing` (Ladeanzeige), `FluentCard` (Antworttext), `FluentTabs` +
+  `FluentDataGrid` (Tabelle). Diagramm bleibt eigenes SVG (Fluent hat keine Chart-Komponente),
+  über Design-Tokens (`--accent-fill-rest` etc.) themed.
 
-## Modell-Empfehlung (nicht-chinesisch)
-Das Modell muss **Tool-Calling** unterstützen, sonst werden die MCP-Tools nicht aufgerufen.
-- **mistral-nemo** (Mistral, FR) — Standardempfehlung, gutes Function-Calling, ~12 GB VRAM
-- **llama3.1:8b** (Meta, US) — leichter, ~8 GB VRAM, solide
-- **mistral-small** (Mistral, FR, ~24B) — am zuverlässigsten, braucht mehr Hardware
+## OAuth-Anmeldung (Metabase 0.63)
+Der eingebaute Metabase-MCP-Server ist **OAuth-only** (kein API-Key). Ablauf:
+1. Der MCP-Client (SDK) startet Discovery + Dynamic Client Registration gegen
+   `/api/mcp` — keine ClientId nötig.
+2. Braucht er Zustimmung, liefert `MetabaseOAuthCoordinator` den Consent-URL an die
+   Seite; die öffnet ihn in einem **neuen Tab** (`window.open`).
+3. Nach Login/Zustimmung leitet Metabase auf `RedirectUri` = `/oauth/callback` um.
+4. Der Callback-Endpoint löst über den `state` die wartende Anmeldung auf; der
+   ursprüngliche `AskAsync`-Aufruf läuft weiter.
 
+Wichtig:
+- `MetabaseMcp:RedirectUri` muss exakt auf den `/oauth/callback` dieser App zeigen
+  (Host + Port wie in `launchSettings.json`), z. B. `https://localhost:7123/oauth/callback`.
+- Der `MetabaseOAuthCoordinator` ist **Singleton** (der Callback kommt als eigener
+  HTTP-Request, nicht im selben Blazor-Circuit).
+
+## SSL-Fehler ignorieren (self-signed / interne CA)
+`MetabaseMcp:IgnoreSslErrors: true` schaltet die TLS-Zertifikatsprüfung für die
+**Metabase-Verbindung** ab (nutzt `DangerousAcceptAnyServerCertificateValidator`).
+Betrifft auch die OAuth-Discovery-Calls, da derselbe `HttpClient` verwendet wird.
+**Nur für Test/Intranet — niemals in Produktion.** Standard ist `false`.
+
+## Modell (nicht-chinesisch, tool-fähig)
+`mistral-nemo` (Empfehlung) · `llama3.1:8b` (leichter) · `mistral-small` (zuverlässigst)
 ```
 ollama pull mistral-nemo
 ```
 
 ## Einrichten
-1. **Ollama** starten (`ollama serve`, Port 11434) und Modell ziehen (siehe oben).
-2. In `appsettings.json` eintragen:
-   - `Ollama:Endpoint` (Standard `http://localhost:11434`), `Ollama:Model`
-   - `MetabaseMcp:Endpoint` (z. B. `https://metabase.firma.de/api/mcp`)
-   - `MetabaseMcp:ApiKey` (Metabase-API-Key)
-3. `dotnet run`, Browser öffnen, Frage stellen (z. B. "Umsatz pro Monat letzte 6 Monate").
+1. Ollama starten, Modell ziehen.
+2. `appsettings.json`: `Ollama:*`, `MetabaseMcp:Endpoint`, `MetabaseMcp:RedirectUri`,
+   ggf. `MetabaseMcp:IgnoreSslErrors: true`.
+3. `dotnet run`, Frage stellen; beim ersten Mal Metabase-Consent im neuen Tab bestätigen.
 
 ## Hinweise
-- Der eingebaute Metabase-MCP-Server respektiert die Rechte des verbundenen Users.
-- Alternativ zu API-Key unterstützt Metabase OAuth 2.0; dann `x-api-key` durch ein
-  Bearer-Token ersetzen.
-- Kleine lokale Modelle sind beim Tool-Calling wackeliger. Wenn Tools nicht auslösen:
-  größeres Modell testen, `Temperature` niedrig lassen (steht auf 0.1).
+- Popup-Blocker kann `window.open` verhindern — dann den Link "hier anmelden" nutzen.
+- Kleine lokale Modelle sind beim Tool-Calling wackeliger; `Temperature` steht auf 0.1.
 
 
