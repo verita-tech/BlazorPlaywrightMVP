@@ -1,6 +1,6 @@
 ===============================================================
  Talk to Data - Blazor Server (.NET 10) + Metabase built-in MCP
- Lokale KI via Ollama. Alle Projektdateien in einer Datei.
+ Lokale KI via Ollama. Aktuelle Paketversionen.
  Jede Datei beginnt mit:  ===== FILE: <pfad> =====
 ===============================================================
 
@@ -11,15 +11,16 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Official MCP client SDK -->
-    <PackageReference Include="ModelContextProtocol" Version="0.4.0-preview.4" />
+    <!-- Official MCP client SDK (v2.x) -->
+    <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
     <!-- Microsoft.Extensions.AI: unified chat + automatic function-calling loop -->
-    <PackageReference Include="Microsoft.Extensions.AI" Version="9.9.0" />
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.9.0" />
     <!-- Local LLM via Ollama (implements IChatClient) -->
-    <PackageReference Include="OllamaSharp" Version="5.4.6" />
+    <PackageReference Include="OllamaSharp" Version="5.4.30" />
   </ItemGroup>
 
 </Project>
@@ -37,7 +38,7 @@
 
   "Ollama": {
     "Endpoint": "http://localhost:11434",
-    "Model": "qwen2.5:7b"
+    "Model": "mistral-nemo"
   },
 
   "MetabaseMcp": {
@@ -100,8 +101,8 @@ public sealed class OllamaOptions
     // Local Ollama server, e.g. http://localhost:11434
     public string Endpoint { get; set; } = "http://localhost:11434";
 
-    // A tool-calling capable model, e.g. qwen2.5:7b, llama3.1:8b, mistral-nemo.
-    public string Model { get; set; } = "qwen2.5:7b";
+    // A tool-calling capable model, e.g. mistral-nemo, llama3.1:8b, mistral-small.
+    public string Model { get; set; } = "mistral-nemo";
 }
 
 public sealed class MetabaseMcpOptions
@@ -140,11 +141,11 @@ public sealed class TalkToDataService : IAsyncDisposable
     private readonly MetabaseMcpOptions _mb;
     private readonly ILogger<TalkToDataService> _log;
 
-    private IMcpClient? _mcp;
+    private McpClient? _mcp;
     private IChatClient? _chat;
     private IList<McpClientTool>? _mcpTools;
 
-    // Captures the last tabular payload seen from any MCP tool during a turn.
+    // Captures tabular payload seen from MCP tools during the current turn.
     private DataAnswer? _current;
 
     public TalkToDataService(
@@ -164,7 +165,9 @@ public sealed class TalkToDataService : IAsyncDisposable
         // Streamable HTTP transport to Metabase's built-in MCP endpoint.
         var transport = new HttpClientTransport(new HttpClientTransportOptions
         {
+            Name = "Metabase",
             Endpoint = new Uri(_mb.Endpoint),
+            TransportMode = HttpTransportMode.AutoDetect,
             AdditionalHeaders = new Dictionary<string, string>
             {
                 ["x-api-key"] = _mb.ApiKey
@@ -174,9 +177,12 @@ public sealed class TalkToDataService : IAsyncDisposable
         _mcp = await McpClient.CreateAsync(transport, cancellationToken: ct);
         _mcpTools = await _mcp.ListToolsAsync(cancellationToken: ct);
 
-        // Local Ollama as the chat client, wrapped so it runs the tool loop itself.
+        // Local Ollama as the chat client. FunctionInvocation runs the tool loop;
+        // our middleware sniffs each tool result for a chartable table.
         var ollama = new OllamaApiClient(new Uri(_ollama.Endpoint), _ollama.Model);
+
         _chat = new ChatClientBuilder(ollama)
+            .Use(inner => new TableSniffingChatClient(inner, () => _current))
             .UseFunctionInvocation()
             .Build();
 
@@ -191,12 +197,6 @@ public sealed class TalkToDataService : IAsyncDisposable
         try
         {
             await EnsureConnectedAsync(ct);
-
-            // Wrap each MCP tool so we can sniff tabular results as they pass through.
-            var tools = _mcpTools!
-                .Select(WrapTool)
-                .Cast<AITool>()
-                .ToList();
 
             var messages = new List<ChatMessage>
             {
@@ -214,12 +214,12 @@ public sealed class TalkToDataService : IAsyncDisposable
 
             var options = new ChatOptions
             {
-                Tools = tools,
+                // McpClientTool derives from AIFunction, so tools pass straight through.
+                Tools = [.. _mcpTools!],
                 ModelId = _ollama.Model,
                 Temperature = 0.1f
             };
 
-            // Extensions.AI drives the whole tool-calling loop against Ollama.
             var response = await _chat!.GetResponseAsync(messages, options, ct);
             answer.Text = response.Text;
 
@@ -239,37 +239,11 @@ public sealed class TalkToDataService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Wrap an MCP tool in an AIFunction that first invokes the real tool,
-    /// then tries to extract a table from the raw result for charting.
-    /// </summary>
-    private AIFunction WrapTool(McpClientTool tool)
-    {
-        return AIFunctionFactory.Create(
-            async (IReadOnlyDictionary<string, object?> args, CancellationToken ct) =>
-            {
-                var dict = args.ToDictionary(k => k.Key, v => v.Value);
-                var result = await _mcp!.CallToolAsync(tool.Name, dict!, cancellationToken: ct);
-
-                var text = string.Concat(result.Content
-                    .OfType<ModelContextProtocol.Protocol.TextContentBlock>()
-                    .Select(c => c.Text));
-
-                if (_current is not null) TryExtractTable(text, _current);
-                return text;
-            },
-            new AIFunctionFactoryOptions
-            {
-                Name = tool.Name,
-                Description = tool.Description ?? tool.Name
-            });
-    }
-
-    /// <summary>
     /// Best-effort: pull rows/columns out of an MCP tool result payload.
     /// Metabase query results usually come back as JSON with a "data" object
     /// containing "cols" and "rows". We also handle a plain array of objects.
     /// </summary>
-    private static void TryExtractTable(string payload, DataAnswer answer)
+    internal static void TryExtractTable(string payload, DataAnswer answer)
     {
         if (answer.HasTable || string.IsNullOrWhiteSpace(payload)) return;
 
@@ -338,6 +312,53 @@ public sealed class TalkToDataService : IAsyncDisposable
     {
         if (_mcp is not null) await _mcp.DisposeAsync();
         if (_chat is IDisposable d) d.Dispose();
+    }
+}
+
+/// <summary>
+/// Delegating chat client that inspects tool-result messages flowing back
+/// through the pipeline and extracts a chartable table from their content.
+/// Sits below UseFunctionInvocation so it sees FunctionResultContent.
+/// </summary>
+internal sealed class TableSniffingChatClient : DelegatingChatClient
+{
+    private readonly Func<DataAnswer?> _current;
+
+    public TableSniffingChatClient(IChatClient inner, Func<DataAnswer?> current)
+        : base(inner) => _current = current;
+
+    public override async Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        Sniff(messages);
+        return await base.GetResponseAsync(messages, options, cancellationToken);
+    }
+
+    public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        Sniff(messages);
+        await foreach (var u in base.GetStreamingResponseAsync(messages, options, cancellationToken))
+            yield return u;
+    }
+
+    private void Sniff(IEnumerable<ChatMessage> messages)
+    {
+        var answer = _current();
+        if (answer is null || answer.HasTable) return;
+
+        foreach (var m in messages)
+        foreach (var c in m.Contents.OfType<FunctionResultContent>())
+        {
+            var text = c.Result as string ?? c.Result?.ToString();
+            if (!string.IsNullOrWhiteSpace(text))
+                TalkToDataService.TryExtractTable(text!, answer);
+            if (answer.HasTable) return;
+        }
     }
 }
 
@@ -646,45 +667,49 @@ th { background: var(--panel); color: var(--muted); font-weight: 600; }
 ===== FILE: README.md =====
 # Talk to Data (Blazor Server, .NET 10)
 
-Eine Blazor-Server-Seite, die per **Metabase built-in MCP-Server** (Metabase 60+)
-Fragen in natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Diagramm**
-darstellt. Das Sprachmodell läuft **lokal über Ollama** — keine Cloud-KI.
+Blazor-Server-Seite, die per **Metabase built-in MCP-Server** (Metabase 60+) Fragen in
+natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Diagramm** darstellt.
+Das Sprachmodell läuft **lokal über Ollama** — keine Cloud-KI.
+
+## Paketversionen (aktuell)
+- `ModelContextProtocol` **2.2.0**  (MCP-Client, v2.x-API)
+- `Microsoft.Extensions.AI` **10.9.0**  (Chat + Function-Calling-Loop)
+- `OllamaSharp` **5.4.30**  (lokales Ollama als IChatClient)
 
 ## Architektur
-- `TalkToDataService` verbindet sich per **Streamable HTTP** mit dem Metabase-MCP-Endpoint
-  (`/api/mcp`) und listet dessen Tools (`search`, `construct_query`, `execute_query`,
-  `execute_sql`, ...).
-- Über **Microsoft.Extensions.AI** + **OllamaSharp** läuft die Function-Calling-Loop
-  gegen ein **lokales Ollama-Modell**. Die MCP-Tools werden automatisch als Funktionen
-  angeboten; das Modell wählt und ruft sie selbst auf.
-- Aus den MCP-Tool-Ergebnissen wird — falls tabellarisch (Metabase `data.cols`/`data.rows`
-  oder Array von Objekten) — eine Tabelle extrahiert.
+- `TalkToDataService` verbindet sich per **Streamable HTTP** (`HttpClientTransport`,
+  `HttpTransportMode.AutoDetect`) mit dem Metabase-MCP-Endpoint (`/api/mcp`) und listet
+  dessen Tools (`search`, `construct_query`, `execute_query`, `execute_sql`, ...).
+- `McpClientTool` leitet von `AIFunction` ab und wird direkt als `ChatOptions.Tools`
+  übergeben. `UseFunctionInvocation()` fährt die Tool-Loop gegen das lokale Ollama-Modell.
+- Ein `DelegatingChatClient` (`TableSniffingChatClient`) unterhalb der Function-Invocation
+  liest `FunctionResultContent` mit und extrahiert eine chartbare Tabelle
+  (Metabase `data.cols`/`data.rows` oder Array von Objekten).
 - Die Page zeigt Antworttext + Umschalter **Diagramm / Tabelle** (abhängigkeitsfreies SVG).
 
-## Voraussetzungen
-1. **Ollama** lokal installiert und gestartet (`ollama serve`, Standard-Port 11434).
-2. Ein **tool-fähiges Modell** gezogen, z. B.:
-   ```
-   ollama pull qwen2.5:7b
-   ```
-   Andere gute Optionen: `llama3.1:8b`, `mistral-nemo`. Wichtig: Das Modell muss
-   Function-Calling / Tools unterstützen, sonst werden die MCP-Tools nicht aufgerufen.
+## Modell-Empfehlung (nicht-chinesisch)
+Das Modell muss **Tool-Calling** unterstützen, sonst werden die MCP-Tools nicht aufgerufen.
+- **mistral-nemo** (Mistral, FR) — Standardempfehlung, gutes Function-Calling, ~12 GB VRAM
+- **llama3.1:8b** (Meta, US) — leichter, ~8 GB VRAM, solide
+- **mistral-small** (Mistral, FR, ~24B) — am zuverlässigsten, braucht mehr Hardware
+
+```
+ollama pull mistral-nemo
+```
 
 ## Einrichten
-1. In `appsettings.json` eintragen:
+1. **Ollama** starten (`ollama serve`, Port 11434) und Modell ziehen (siehe oben).
+2. In `appsettings.json` eintragen:
    - `Ollama:Endpoint` (Standard `http://localhost:11434`), `Ollama:Model`
    - `MetabaseMcp:Endpoint` (z. B. `https://metabase.firma.de/api/mcp`)
    - `MetabaseMcp:ApiKey` (Metabase-API-Key)
-2. `dotnet run`
-3. Browser öffnen, Frage stellen (z. B. "Umsatz pro Monat letzte 6 Monate").
+3. `dotnet run`, Browser öffnen, Frage stellen (z. B. "Umsatz pro Monat letzte 6 Monate").
 
 ## Hinweise
 - Der eingebaute Metabase-MCP-Server respektiert die Rechte des verbundenen Users.
 - Alternativ zu API-Key unterstützt Metabase OAuth 2.0; dann `x-api-key` durch ein
   Bearer-Token ersetzen.
-- Kleinere lokale Modelle sind beim Tool-Calling weniger zuverlässig. Wenn Tools nicht
-  ausgelöst werden: größeres/aktuelleres Modell testen und `Temperature` niedrig lassen.
-- Paketversionen (`ModelContextProtocol`, `Microsoft.Extensions.AI`, `OllamaSharp`) ggf.
-  auf die neuesten stabilen Stände anheben.
+- Kleine lokale Modelle sind beim Tool-Calling wackeliger. Wenn Tools nicht auslösen:
+  größeres Modell testen, `Temperature` niedrig lassen (steht auf 0.1).
 
 
