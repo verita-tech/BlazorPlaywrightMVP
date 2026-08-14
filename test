@@ -1,6 +1,6 @@
 ===============================================================
  Talk to Data - Blazor Server (.NET 10) + Metabase built-in MCP
- Alle Projektdateien in einer Datei.
+ Lokale KI via Ollama. Alle Projektdateien in einer Datei.
  Jede Datei beginnt mit:  ===== FILE: <pfad> =====
 ===============================================================
 
@@ -16,8 +16,10 @@
   <ItemGroup>
     <!-- Official MCP client SDK -->
     <PackageReference Include="ModelContextProtocol" Version="0.4.0-preview.4" />
-    <!-- Anthropic SDK to let Claude choose which Metabase MCP tools to call -->
-    <PackageReference Include="Anthropic.SDK" Version="5.5.1" />
+    <!-- Microsoft.Extensions.AI: unified chat + automatic function-calling loop -->
+    <PackageReference Include="Microsoft.Extensions.AI" Version="9.9.0" />
+    <!-- Local LLM via Ollama (implements IChatClient) -->
+    <PackageReference Include="OllamaSharp" Version="5.4.6" />
   </ItemGroup>
 
 </Project>
@@ -33,9 +35,9 @@
   },
   "AllowedHosts": "*",
 
-  "Anthropic": {
-    "ApiKey": "sk-ant-REPLACE_ME",
-    "Model": "claude-opus-4-8"
+  "Ollama": {
+    "Endpoint": "http://localhost:11434",
+    "Model": "qwen2.5:7b"
   },
 
   "MetabaseMcp": {
@@ -54,7 +56,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
-builder.Services.Configure<AnthropicOptions>(builder.Configuration.GetSection("Anthropic"));
+builder.Services.Configure<OllamaOptions>(builder.Configuration.GetSection("Ollama"));
 builder.Services.Configure<MetabaseMcpOptions>(builder.Configuration.GetSection("MetabaseMcp"));
 
 // One MCP/Anthropic connection per circuit (user session) is a sensible default.
@@ -93,10 +95,13 @@ app.Run();
 ===== FILE: Services/Options.cs =====
 namespace TalkToData.Services;
 
-public sealed class AnthropicOptions
+public sealed class OllamaOptions
 {
-    public string ApiKey { get; set; } = "";
-    public string Model { get; set; } = "claude-opus-4-8";
+    // Local Ollama server, e.g. http://localhost:11434
+    public string Endpoint { get; set; } = "http://localhost:11434";
+
+    // A tool-calling capable model, e.g. qwen2.5:7b, llama3.1:8b, mistral-nemo.
+    public string Model { get; set; } = "qwen2.5:7b";
 }
 
 public sealed class MetabaseMcpOptions
@@ -105,20 +110,17 @@ public sealed class MetabaseMcpOptions
     // e.g. https://your-metabase.example.com/api/mcp
     public string Endpoint { get; set; } = "";
 
-    // Metabase API key. Sent as x-api-key; the built-in server also
-    // supports OAuth, but an API key is simplest for a server-side app.
+    // Metabase API key. Sent as x-api-key.
     public string ApiKey { get; set; } = "";
 }
 
 
 ===== FILE: Services/TalkToDataService.cs =====
 using System.Text.Json;
-using Anthropic.SDK;
-using Anthropic.SDK.Common;
-using Anthropic.SDK.Constants;
-using Anthropic.SDK.Messaging;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Client;
+using OllamaSharp;
 
 namespace TalkToData.Services;
 
@@ -134,20 +136,23 @@ public sealed class DataAnswer
 
 public sealed class TalkToDataService : IAsyncDisposable
 {
-    private readonly AnthropicOptions _ai;
+    private readonly OllamaOptions _ollama;
     private readonly MetabaseMcpOptions _mb;
     private readonly ILogger<TalkToDataService> _log;
 
     private IMcpClient? _mcp;
+    private IChatClient? _chat;
     private IList<McpClientTool>? _mcpTools;
-    private AnthropicClient? _anthropic;
+
+    // Captures the last tabular payload seen from any MCP tool during a turn.
+    private DataAnswer? _current;
 
     public TalkToDataService(
-        IOptions<AnthropicOptions> ai,
+        IOptions<OllamaOptions> ollama,
         IOptions<MetabaseMcpOptions> mb,
         ILogger<TalkToDataService> log)
     {
-        _ai = ai.Value;
+        _ollama = ollama.Value;
         _mb = mb.Value;
         _log = log;
     }
@@ -168,7 +173,12 @@ public sealed class TalkToDataService : IAsyncDisposable
 
         _mcp = await McpClient.CreateAsync(transport, cancellationToken: ct);
         _mcpTools = await _mcp.ListToolsAsync(cancellationToken: ct);
-        _anthropic = new AnthropicClient(_ai.ApiKey);
+
+        // Local Ollama as the chat client, wrapped so it runs the tool loop itself.
+        var ollama = new OllamaApiClient(new Uri(_ollama.Endpoint), _ollama.Model);
+        _chat = new ChatClientBuilder(ollama)
+            .UseFunctionInvocation()
+            .Build();
 
         _log.LogInformation("Connected to Metabase MCP. Tools: {Tools}",
             string.Join(", ", _mcpTools.Select(t => t.Name)));
@@ -177,79 +187,41 @@ public sealed class TalkToDataService : IAsyncDisposable
     public async Task<DataAnswer> AskAsync(string question, CancellationToken ct = default)
     {
         var answer = new DataAnswer();
+        _current = answer;
         try
         {
             await EnsureConnectedAsync(ct);
 
-            // Map MCP tools -> Anthropic tool definitions.
+            // Wrap each MCP tool so we can sniff tabular results as they pass through.
             var tools = _mcpTools!
-                .Select(t => Tool.FromFunc(
-                    t.Name,
-                    t.Description ?? t.Name,
-                    JsonSerializer.Serialize(t.JsonSchema)))
+                .Select(WrapTool)
+                .Cast<AITool>()
                 .ToList();
 
-            var messages = new List<Message>
+            var messages = new List<ChatMessage>
             {
-                new(RoleType.User, question)
-            };
-
-            var system = new List<SystemMessage>
-            {
-                new("""
-                    You are a data analyst connected to Metabase via MCP tools.
+                new(ChatRole.System,
+                    """
+                    You are a data analyst connected to Metabase via tools.
                     Use the tools to search for the right table/metric, build and
-                    execute a query, and answer the user's question.
-                    When you return tabular results, keep them small and relevant
-                    (aggregate/limit rows) so they can be charted. Explain the
-                    result briefly in the user's language.
-                    """)
+                    execute a query, then answer the user's question.
+                    Keep tabular results small and relevant (aggregate/limit rows)
+                    so they can be charted. Explain the result briefly in the
+                    user's language (German if the question is German).
+                    """),
+                new(ChatRole.User, question)
             };
 
-            // Agentic loop: let Claude call MCP tools until it produces a final answer.
-            for (var step = 0; step < 8; step++)
+            var options = new ChatOptions
             {
-                var res = await _anthropic!.Messages.GetClaudeMessageAsync(new MessageParameters
-                {
-                    Model = string.IsNullOrWhiteSpace(_ai.Model) ? AnthropicModels.Claude4Opus : _ai.Model,
-                    MaxTokens = 2048,
-                    Messages = messages,
-                    System = system,
-                    Tools = tools
-                }, ct);
+                Tools = tools,
+                ModelId = _ollama.Model,
+                Temperature = 0.1f
+            };
 
-                messages.Add(res.Message);
-
-                var toolCalls = res.Content.OfType<ToolUseContent>().ToList();
-                if (toolCalls.Count == 0)
-                {
-                    answer.Text = res.Message.ToString() ?? "";
-                    break;
-                }
-
-                var toolResults = new List<ContentBase>();
-                foreach (var call in toolCalls)
-                {
-                    var mcpTool = _mcpTools!.First(t => t.Name == call.Name);
-                    var args = call.Input.Deserialize<Dictionary<string, object?>>() ?? new();
-
-                    var result = await _mcp!.CallToolAsync(mcpTool.Name, args!, cancellationToken: ct);
-
-                    var text = string.Concat(result.Content
-                        .OfType<ModelContextProtocol.Protocol.TextContentBlock>()
-                        .Select(c => c.Text));
-
-                    TryExtractTable(text, answer);
-
-                    toolResults.Add(new ToolResultContent
-                    {
-                        ToolUseId = call.Id,
-                        Content = new List<ContentBase> { new TextContent { Text = text } }
-                    });
-                }
-
-                messages.Add(new Message(RoleType.User, toolResults));
-            }
+            // Extensions.AI drives the whole tool-calling loop against Ollama.
+            var response = await _chat!.GetResponseAsync(messages, options, ct);
+            answer.Text = response.Text;
 
             if (string.IsNullOrWhiteSpace(answer.Text))
                 answer.Text = "Ich konnte keine textliche Antwort erzeugen.";
@@ -259,11 +231,41 @@ public sealed class TalkToDataService : IAsyncDisposable
             _log.LogError(ex, "Talk-to-data failed");
             answer.Error = ex.Message;
         }
+        finally
+        {
+            _current = null;
+        }
         return answer;
     }
 
     /// <summary>
-    /// Best-effort: pull a rows/columns table out of an MCP tool result payload.
+    /// Wrap an MCP tool in an AIFunction that first invokes the real tool,
+    /// then tries to extract a table from the raw result for charting.
+    /// </summary>
+    private AIFunction WrapTool(McpClientTool tool)
+    {
+        return AIFunctionFactory.Create(
+            async (IReadOnlyDictionary<string, object?> args, CancellationToken ct) =>
+            {
+                var dict = args.ToDictionary(k => k.Key, v => v.Value);
+                var result = await _mcp!.CallToolAsync(tool.Name, dict!, cancellationToken: ct);
+
+                var text = string.Concat(result.Content
+                    .OfType<ModelContextProtocol.Protocol.TextContentBlock>()
+                    .Select(c => c.Text));
+
+                if (_current is not null) TryExtractTable(text, _current);
+                return text;
+            },
+            new AIFunctionFactoryOptions
+            {
+                Name = tool.Name,
+                Description = tool.Description ?? tool.Name
+            });
+    }
+
+    /// <summary>
+    /// Best-effort: pull rows/columns out of an MCP tool result payload.
     /// Metabase query results usually come back as JSON with a "data" object
     /// containing "cols" and "rows". We also handle a plain array of objects.
     /// </summary>
@@ -276,7 +278,6 @@ public sealed class TalkToDataService : IAsyncDisposable
             using var doc = JsonDocument.Parse(payload);
             var root = doc.RootElement;
 
-            // Shape A: { "data": { "cols": [...], "rows": [[...], ...] } }
             var data = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("data", out var d)
                 ? d : root;
 
@@ -302,7 +303,6 @@ public sealed class TalkToDataService : IAsyncDisposable
                 return;
             }
 
-            // Shape B: [ { "a": 1, "b": 2 }, ... ]
             if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0 &&
                 root[0].ValueKind == JsonValueKind.Object)
             {
@@ -320,7 +320,7 @@ public sealed class TalkToDataService : IAsyncDisposable
         }
         catch
         {
-            // Not JSON / not tabular — that's fine, we just show the text answer.
+            // Not JSON / not tabular — fine, we just show the text answer.
         }
     }
 
@@ -337,6 +337,7 @@ public sealed class TalkToDataService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (_mcp is not null) await _mcp.DisposeAsync();
+        if (_chat is IDisposable d) d.Dispose();
     }
 }
 
@@ -646,20 +647,32 @@ th { background: var(--panel); color: var(--muted); font-weight: 600; }
 # Talk to Data (Blazor Server, .NET 10)
 
 Eine Blazor-Server-Seite, die per **Metabase built-in MCP-Server** (Metabase 60+)
-Fragen in natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Diagramm** darstellt.
+Fragen in natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Diagramm**
+darstellt. Das Sprachmodell läuft **lokal über Ollama** — keine Cloud-KI.
 
 ## Architektur
 - `TalkToDataService` verbindet sich per **Streamable HTTP** mit dem Metabase-MCP-Endpoint
-  (`/api/mcp`), listet dessen Tools (`search`, `construct_query`, `execute_query`,
-  `execute_sql`, ...) und lässt **Claude** in einer Tool-Loop die passenden Tools aufrufen.
+  (`/api/mcp`) und listet dessen Tools (`search`, `construct_query`, `execute_query`,
+  `execute_sql`, ...).
+- Über **Microsoft.Extensions.AI** + **OllamaSharp** läuft die Function-Calling-Loop
+  gegen ein **lokales Ollama-Modell**. Die MCP-Tools werden automatisch als Funktionen
+  angeboten; das Modell wählt und ruft sie selbst auf.
 - Aus den MCP-Tool-Ergebnissen wird — falls tabellarisch (Metabase `data.cols`/`data.rows`
   oder Array von Objekten) — eine Tabelle extrahiert.
-- Die Page zeigt Antworttext + Umschalter **Diagramm / Tabelle**.
-  Das Diagramm ist ein abhängigkeitsfreies SVG-Balkendiagramm.
+- Die Page zeigt Antworttext + Umschalter **Diagramm / Tabelle** (abhängigkeitsfreies SVG).
+
+## Voraussetzungen
+1. **Ollama** lokal installiert und gestartet (`ollama serve`, Standard-Port 11434).
+2. Ein **tool-fähiges Modell** gezogen, z. B.:
+   ```
+   ollama pull qwen2.5:7b
+   ```
+   Andere gute Optionen: `llama3.1:8b`, `mistral-nemo`. Wichtig: Das Modell muss
+   Function-Calling / Tools unterstützen, sonst werden die MCP-Tools nicht aufgerufen.
 
 ## Einrichten
 1. In `appsettings.json` eintragen:
-   - `Anthropic:ApiKey`, ggf. `Anthropic:Model`
+   - `Ollama:Endpoint` (Standard `http://localhost:11434`), `Ollama:Model`
    - `MetabaseMcp:Endpoint` (z. B. `https://metabase.firma.de/api/mcp`)
    - `MetabaseMcp:ApiKey` (Metabase-API-Key)
 2. `dotnet run`
@@ -667,10 +680,11 @@ Fragen in natürlicher Sprache beantwortet und Ergebnisse **textlich oder als Di
 
 ## Hinweise
 - Der eingebaute Metabase-MCP-Server respektiert die Rechte des verbundenen Users.
-- Alternativ zu API-Key unterstützt Metabase OAuth 2.0; für eine reine Server-App
-  ist der API-Key am einfachsten. Bei OAuth den `x-api-key`-Header durch ein Bearer-Token ersetzen.
-- Paketversionen (`ModelContextProtocol`, `Anthropic.SDK`) ggf. auf die neuesten
-  stabilen Stände anheben; die Tool-Loop-API kann je nach SDK-Version leicht abweichen.
-
+- Alternativ zu API-Key unterstützt Metabase OAuth 2.0; dann `x-api-key` durch ein
+  Bearer-Token ersetzen.
+- Kleinere lokale Modelle sind beim Tool-Calling weniger zuverlässig. Wenn Tools nicht
+  ausgelöst werden: größeres/aktuelleres Modell testen und `Temperature` niedrig lassen.
+- Paketversionen (`ModelContextProtocol`, `Microsoft.Extensions.AI`, `OllamaSharp`) ggf.
+  auf die neuesten stabilen Stände anheben.
 
 
