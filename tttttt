@@ -1,0 +1,142 @@
+========================================================================
+Blazor WASM Standalone (.NET 10) + Web API + Keycloak-Login
+mit FluentUI-Username oben rechts
+========================================================================
+
+
+------------------------------------------------------------------------
+1. NUGET-PAKETE
+------------------------------------------------------------------------
+
+Microsoft.AspNetCore.Components.WebAssembly.Authentication
+Microsoft.FluentUI.AspNetCore.Components
+
+
+------------------------------------------------------------------------
+2. PROGRAM.CS
+------------------------------------------------------------------------
+
+builder.Services.AddOidcAuthentication(options =>
+{
+    builder.Configuration.Bind("Oidc", options.ProviderOptions);
+    options.ProviderOptions.ResponseType = "code"; // PKCE
+    // Wichtig fuer Username-Claim aus Keycloak:
+    options.UserOptions.NameClaim = "preferred_username";
+});
+builder.Services.AddFluentUIComponents();
+
+
+------------------------------------------------------------------------
+3. wwwroot/appsettings.json
+------------------------------------------------------------------------
+
+{
+  "Oidc": {
+    "Authority": "https://keycloak.example.com/realms/DEIN_REALM",
+    "ClientId": "blazor-wasm",
+    "ResponseType": "code",
+    "DefaultScopes": [ "openid", "profile", "email" ]
+  }
+}
+
+
+------------------------------------------------------------------------
+4. KEYCLOAK-CLIENT-KONFIGURATION
+------------------------------------------------------------------------
+
+Im Keycloak-Admin fuer den Client "blazor-wasm":
+
+  - Access Type: public
+  - Standard Flow enabled: on (Authorization Code + PKCE)
+  - Valid Redirect URIs:
+        https://deine-app/authentication/login-callback
+  - Valid Post Logout Redirect URIs:
+        https://deine-app/authentication/logout-callback
+        <-- fehlt meist, wenn Logout nicht geht!
+  - Web Origins: +  (oder deine Origin explizit)
+
+
+------------------------------------------------------------------------
+5. LOGOUT-PROBLEM
+------------------------------------------------------------------------
+
+Logout scheitert bei Keycloak fast immer an zwei Dingen:
+
+a) Post-Logout-Redirect-URI nicht registriert (siehe Punkt 4).
+
+b) Keycloak verlangt bei OIDC-Logout je nach Version den
+   id_token_hint. Die Standard-RemoteAuthenticatorView macht das
+   korrekt, wenn du sie einbindest.
+
+In neueren Keycloak-Versionen (18+) ist der Endpoint
+   /protocol/openid-connect/logout
+und erfordert entweder id_token_hint ODER
+client_id + post_logout_redirect_uri.
+
+Bei Problemen: Browser-Konsole / Network-Tab auf die genaue
+Fehlermeldung pruefen.
+
+
+------------------------------------------------------------------------
+6. Authentication.razor
+------------------------------------------------------------------------
+
+@page "/authentication/{action}"
+@using Microsoft.AspNetCore.Components.WebAssembly.Authentication
+
+<RemoteAuthenticatorView Action="@Action" />
+
+@code {
+    [Parameter] public string? Action { get; set; }
+}
+
+
+------------------------------------------------------------------------
+7. MainLayout.razor  (Username oben rechts mit FluentUI)
+------------------------------------------------------------------------
+
+@using Microsoft.AspNetCore.Components.Authorization
+
+<FluentLayout>
+    <FluentHeader>
+        <span>Meine App</span>
+        <FluentSpacer />
+        <AuthorizeView>
+            <Authorized>
+                <FluentStack Orientation="Orientation.Horizontal"
+                             VerticalAlignment="VerticalAlignment.Center">
+                    <FluentPersona Name="@context.User.Identity?.Name"
+                                   ImageSize="32px" />
+                    <FluentButton Appearance="Appearance.Stealth"
+                                  @onclick="BeginLogout">Abmelden</FluentButton>
+                </FluentStack>
+            </Authorized>
+            <NotAuthorized>
+                <FluentButton @onclick="BeginLogin">Anmelden</FluentButton>
+            </NotAuthorized>
+        </AuthorizeView>
+    </FluentHeader>
+    <FluentBodyContent>@Body</FluentBodyContent>
+</FluentLayout>
+
+@code {
+    [Inject] NavigationManager Nav { get; set; } = default!;
+    void BeginLogin()  => Nav.NavigateToLogin("authentication/login");
+    void BeginLogout() => Nav.NavigateToLogout("authentication/logout");
+}
+
+
+------------------------------------------------------------------------
+8. HINWEISE
+------------------------------------------------------------------------
+
+- context.User.Identity?.Name liefert den Wert des NameClaim
+  (preferred_username) - also den AD-Benutzernamen, wenn Keycloak
+  per LDAP/AD foederiert ist.
+
+- App.razor muss in CascadingAuthenticationState gewrappt sein.
+
+- _Imports.razor sollte enthalten:
+      @using Microsoft.AspNetCore.Components.Authorization
+
+========================================================================
